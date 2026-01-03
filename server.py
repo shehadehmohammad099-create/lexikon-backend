@@ -195,3 +195,25 @@ Translation (for reference only):
             status_code=500,
             content={"error": str(e)}
         )
+
+
+@app.post("/create-portal-session")
+def create_portal_session(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    origin = request.headers.get("origin")
+
+    # fallback for safety
+    if not origin:
+        origin = "https://the-lexicon-project.netlify.app"
+
+    session = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=f"{origin}/static/app.html"
+    )
+
+    return {"url": session.url}
