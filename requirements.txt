@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 stripe
-openai
+openai==0.28
 pydantic
 
