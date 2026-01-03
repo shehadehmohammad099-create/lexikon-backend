@@ -3,4 +3,4 @@ uvicorn
 stripe
 openai==0.28.1
 pydantic
-typing
+
