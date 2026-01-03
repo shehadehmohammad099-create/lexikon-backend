@@ -233,7 +233,7 @@ def create_portal_session(request: Request):
 
     session = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}/static/app.html"
+        return_url=f"{origin}/frontend/static/app.html"
     )
 
     return {"url": session.url}
