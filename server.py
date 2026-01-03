@@ -63,15 +63,33 @@ class ExplainWord(BaseModel):
 # -------------------------
     
 FRONTEND_URL = "https://the-lexicon-project.netlify.app"
+# @app.get("/create-checkout-session")
+# def create_checkout_session():
+#     session = stripe.checkout.Session.create(
+#         mode="subscription",
+#         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+#         success_url=f"{FRONTEND_URL}/static/confirmation.html?session_id={{CHECKOUT_SESSION_ID}}",
+#         cancel_url=FRONTEND_URL,
+#     )
+#     return {"url": session.url}
+
 @app.get("/create-checkout-session")
-def create_checkout_session():
+def create_checkout_session(request: Request):
+    origin = request.headers.get("origin")
+
+    # Fallback to prod if origin missing
+    if not origin:
+        origin = "https://the-lexicon-project.netlify.app"
+
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=f"{FRONTEND_URL}/static/confirmation.html?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=FRONTEND_URL,
+        success_url=f"{origin}/?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{origin}/"
     )
+
     return {"url": session.url}
+
 
 @app.get("/checkout-success")
 def checkout_success(session_id: str):
