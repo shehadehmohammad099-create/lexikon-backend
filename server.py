@@ -426,3 +426,33 @@ def search_annotations(q: str, request: Request):
 
     rows = cur.fetchall()
     return {"results": rows}
+
+
+@app.get("/restore-pro")
+def restore_pro(session_id: str):
+    session = stripe.checkout.Session.retrieve(session_id)
+    customer_id = session.customer
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="No customer")
+
+    # Check active subscription
+    subs = stripe.Subscription.list(
+        customer=customer_id,
+        status="active",
+        limit=1
+    )
+
+    if not subs.data:
+        raise HTTPException(status_code=402, detail="No active subscription")
+
+    # Issue NEW token
+    token = secrets.token_urlsafe(32)
+
+    cur.execute("""
+    INSERT INTO pro_tokens (token, customer_id)
+    VALUES (%s, %s)
+    ON CONFLICT DO NOTHING
+    """, (token, customer_id))
+
+    return {"pro_token": token}
