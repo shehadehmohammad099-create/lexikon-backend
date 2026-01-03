@@ -281,15 +281,70 @@ Translation (for reference only):
         )
 
 
-@app.get("/create-portal-session")
-def create_portal_session(request: Request):
+# @app.get("/create-portal-session")
+# def create_portal_session(request: Request):
+#     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
+
+#     portal = stripe.billing_portal.Session.create(
+#         return_url=f"{origin}/static/app.html?restore=1"
+#     )
+
+#     return {"url": portal.url}
+
+
+@app.get("/billing/portal")
+def billing_portal(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        raise HTTPException(status_code=401)
+
     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
 
     portal = stripe.billing_portal.Session.create(
-        return_url=f"{origin}/static/app.html?restore=1"
+        customer=customer_id,
+        return_url=f"{origin}/static/app.html"
     )
 
     return {"url": portal.url}
+
+
+@app.get("/billing/restore")
+def billing_restore(request: Request):
+    origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=f"{origin}/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{origin}/static/app.html",
+        customer_creation="if_required"
+    )
+
+    return {"url": session.url}
+
+
+@app.get("/billing/restore-token")
+def billing_restore_token(session_id: str):
+    session = stripe.checkout.Session.retrieve(session_id)
+
+    customer_id = session.customer
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="No customer on session")
+
+    # Check active subscription
+    subs = stripe.Subscription.list(customer=customer_id, status="active", limit=1)
+    if not subs.data:
+        raise HTTPException(status_code=402, detail="No active subscription")
+
+    token = secrets.token_urlsafe(32)
+
+    cur.execute(
+        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+        (token, customer_id)
+    )
+
+    return {"pro_token": token}
 
 
 
