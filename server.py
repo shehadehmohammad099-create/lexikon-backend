@@ -13,11 +13,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://the-lexicon-project.netlify.app", "*"],            # for now
-    allow_credentials=False,        # IMPORTANT
+    allow_origin_regex=r"https://.*\.netlify\.app|http://localhost:8000",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------
 # ENV
