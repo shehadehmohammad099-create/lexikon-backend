@@ -303,7 +303,8 @@ class SaveAnnotation(BaseModel):
     work_id: str
     section_id: str
     token_id: Optional[str] = None  # word-level; can be null for passage-level later
-    content: str
+    content: str,
+    visibility: Optional[str] = "private"
 
 @app.post("/annotations")
 def save_annotation(req: SaveAnnotation, request: Request):
@@ -314,11 +315,11 @@ def save_annotation(req: SaveAnnotation, request: Request):
 
     # Upsert by unique index
     cur.execute("""
-    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content)
-    VALUES (%s, %s, %s, %s, %s)
+    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content, visibility)
+    VALUES (%s, %s, %s, %s, %s, %s)
     ON CONFLICT (customer_id, work_id, section_id, token_id)
-    DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
-    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content))
+    DO UPDATE SET content = EXCLUDED.content, visibility = EXCLUDED.visibility, updated_at = NOW()
+    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, req.visibility))
 
     return {"ok": True}
 
