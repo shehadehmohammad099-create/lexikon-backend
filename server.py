@@ -322,7 +322,6 @@ def billing_restore(request: Request):
             line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
             success_url=f"{origin}/frontend/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{origin}/frontend/static/app.html",
-            customer_creation="if_required"
         )
 
         return {"url": session.url}
