@@ -13,13 +13,6 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS pro_tokens (
-  token TEXT PRIMARY KEY,
-  customer_id TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT NOW()
-)
-""")
 
 
 if not DATABASE_URL:
