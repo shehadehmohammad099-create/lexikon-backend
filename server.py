@@ -21,7 +21,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://frabjous-begonia-1cbd54.netlify.app"
+        "*"
     ],
     allow_credentials=True,
     allow_methods=["*"],
