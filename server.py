@@ -82,7 +82,7 @@ def create_checkout_session(request: Request):
         origin = "https://the-lexicon-project.netlify.app"
 
     # ALWAYS go to index.html
-    success_url = f"{origin}/index.html?session_id={{CHECKOUT_SESSION_ID}}"
+    success_url = f"{origin}/frontend/index.html?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{origin}/index.html"
 
     session = stripe.checkout.Session.create(
