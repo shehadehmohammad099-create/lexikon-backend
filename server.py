@@ -3,7 +3,18 @@ import secrets
 import stripe
 import openai
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],            # for now
+    allow_credentials=False,        # IMPORTANT
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------
 # ENV
@@ -16,15 +27,7 @@ FRONTEND_URL = os.environ["FRONTEND_URL"]  # e.g. https://lexikon.netlify.app/ap
 openai.api_key = OPENAI_API_KEY
 stripe.api_key = STRIPE_SECRET_KEY
 
-app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],            # for now
-    allow_credentials=False,        # IMPORTANT
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # -------------------------
 # TEMP PRO TOKENS (memory)
