@@ -93,7 +93,7 @@ def explain_word(req: ExplainWord, request: Request):
 
         prompt = f"""
 Explain this word philologically.
-
+It is either in Latin or Greek.
 Word: {req.token}
 Lemma: {req.lemma}
 POS: {req.pos}
