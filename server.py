@@ -311,24 +311,24 @@ def billing_portal(request: Request):
 
 @app.get("/billing/restore")
 def billing_restore(request: Request):
-    try:
-        origin = request.headers.get("origin") or "http://localhost:5500"
+    origin = request.headers.get("origin") or "http://localhost:5500"
 
-        print("RESTORE ORIGIN:", origin)
-        print("PRICE ID:", STRIPE_PRICE_ID)
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        subscription_data={
+            "trial_settings": {
+                "end_behavior": {
+                    "missing_payment_method": "cancel"
+                }
+            }
+        },
+        success_url=f"{origin}/frontend/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{origin}/frontend/static/app.html",
+    )
 
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-            success_url=f"{origin}/frontend/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{origin}/frontend/static/app.html",
-        )
+    return {"url": session.url}
 
-        return {"url": session.url}
-
-    except Exception as e:
-        print("RESTORE ERROR:", e)
-        raise
 
 
 
