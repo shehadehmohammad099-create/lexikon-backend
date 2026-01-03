@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
+from typing import Optional
 
 
 app = FastAPI()
@@ -127,6 +128,69 @@ Context: {req.sentence}
     except Exception as e:
         # THIS is what was causing the “CORS” error
         print("AI ERROR:", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+class ExplainPassage(BaseModel):
+    work: str
+    section: str
+    speaker: Optional[str] = ""
+    greek: str
+    translation: Optional[str] = ""
+
+# ---- endpoint ----
+
+@app.post("/ai/explain-passage")
+def explain_passage(req: ExplainPassage, request: Request):
+    try:
+        # Pro check (same as explain-word)
+        pro = request.headers.get("X-Pro-Token")
+        if not has_pro(pro):
+            raise HTTPException(status_code=402, detail="Pro required")
+
+        # Prompt (commentary, not summary)
+        prompt = f"""
+Explain this passage philologically.
+Do NOT summarize or paraphrase.
+Focus on syntax, structure, and argumentative flow.
+Explain why the Greek may be difficult to read.
+
+Work: {req.work}
+Section: {req.section}
+Speaker: {req.speaker}
+
+Greek text:
+{req.greek}
+
+Translation (for reference only):
+{req.translation}
+"""
+
+        # Same OpenAI call style as explain-word
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a classical philologist."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=500,
+        )
+
+        return {
+            "explanation": r.choices[0].message.content.strip()
+        }
+
+    except HTTPException as e:
+        # Preserve correct status codes (e.g. 402)
+        raise e
+
+    except Exception as e:
+        # Prevent masked CORS errors
+        print("AI ERROR (passage):", e)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
