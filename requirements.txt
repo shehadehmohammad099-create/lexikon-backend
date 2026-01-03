@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 stripe
-openai==0.28.1
+openai
 pydantic
-
+psycopg2-binary
