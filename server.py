@@ -406,3 +406,23 @@ def get_public_annotations(work_id: str, section_id: str):
         out[r["token_id"]] = r["content"]
 
     return {"annotations": out}
+
+
+@app.get("/annotations/search")
+def search_annotations(q: str, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        raise HTTPException(status_code=401)
+
+    cur.execute("""
+    SELECT work_id, section_id, token_id, content
+    FROM annotations
+    WHERE customer_id = %s
+      AND content ILIKE %s
+    ORDER BY updated_at DESC
+    LIMIT 50
+    """, (customer_id, f"%{q}%"))
+
+    rows = cur.fetchall()
+    return {"results": rows}
