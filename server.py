@@ -28,6 +28,27 @@ CREATE TABLE IF NOT EXISTS pro_tokens (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS annotations (
+  id SERIAL PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  work_id TEXT NOT NULL,
+  section_id TEXT NOT NULL,
+  token_id TEXT,
+  content TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+)
+""")
+
+cur.execute("""
+CREATE UNIQUE INDEX IF NOT EXISTS annotations_unique
+ON annotations (customer_id, work_id, section_id, token_id)
+""")
+
+
+
+
 app = FastAPI()
 
 app.add_middleware(
@@ -276,3 +297,50 @@ def create_portal_session(request: Request):
     )
 
     return {"url": portal.url}
+
+
+class SaveAnnotation(BaseModel):
+    work_id: str
+    section_id: str
+    token_id: Optional[str] = None  # word-level; can be null for passage-level later
+    content: str
+
+@app.post("/annotations")
+def save_annotation(req: SaveAnnotation, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Upsert by unique index
+    cur.execute("""
+    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content)
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (customer_id, work_id, section_id, token_id)
+    DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
+    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content))
+
+    return {"ok": True}
+
+
+@app.get("/annotations")
+def get_annotations(work_id: str, section_id: str, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    cur.execute("""
+    SELECT token_id, content
+    FROM annotations
+    WHERE customer_id = %s AND work_id = %s AND section_id = %s
+    """, (customer_id, work_id, section_id))
+
+    rows = cur.fetchall()
+
+    # Return as a dict keyed by token_id so frontend can apply markers fast
+    out = {}
+    for r in rows:
+        out[r["token_id"]] = r["content"]
+
+    return {"annotations": out}
