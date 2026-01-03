@@ -311,17 +311,26 @@ def billing_portal(request: Request):
 
 @app.get("/billing/restore")
 def billing_restore(request: Request):
-    origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
+    try:
+        origin = request.headers.get("origin") or "http://localhost:5500"
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=f"{origin}/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{origin}/static/app.html",
-        customer_creation="if_required"
-    )
+        print("RESTORE ORIGIN:", origin)
+        print("PRICE ID:", STRIPE_PRICE_ID)
 
-    return {"url": session.url}
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=f"{origin}/frontend/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{origin}/frontend/static/app.html",
+            customer_creation="if_required"
+        )
+
+        return {"url": session.url}
+
+    except Exception as e:
+        print("RESTORE ERROR:", e)
+        raise
+
 
 
 @app.get("/billing/restore-token")
