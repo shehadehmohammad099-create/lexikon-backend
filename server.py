@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import Response
+from fastapi.responses import JSONResponse
 
 
 app = FastAPI()
@@ -59,7 +60,7 @@ class ExplainWord(BaseModel):
 # -------------------------
 # STRIPE
 # -------------------------
-
+    
 FRONTEND_URL = "https://frabjous-begonia-1cbd54.netlify.app"
 @app.get("/create-checkout-session")
 def create_checkout_session():
@@ -82,13 +83,15 @@ def checkout_success(session_id: str):
 # -------------------------
 # AI (PAID)
 # -------------------------
+
 @app.post("/ai/explain-word")
 def explain_word(req: ExplainWord, request: Request):
-    pro = request.headers.get("X-Pro-Token")
-    if not has_pro(pro):
-        raise HTTPException(402, "Pro required")
+    try:
+        pro = request.headers.get("X-Pro-Token")
+        if not has_pro(pro):
+            raise HTTPException(status_code=402, detail="Pro required")
 
-    prompt = f"""
+        prompt = f"""
 Explain this word philologically.
 
 Word: {req.token}
@@ -98,14 +101,27 @@ Morphology: {req.morph}
 Context: {req.sentence}
 """
 
-    r = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a classical philologist."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.3,
-        max_tokens=300,
-    )
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a classical philologist."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=300,
+        )
 
-    return {"explanation": r.choices[0].message.content.strip()}
+        return {"explanation": r.choices[0].message.content.strip()}
+
+    except HTTPException as e:
+        # preserve correct status codes like 402
+        raise e
+
+    except Exception as e:
+        # THIS is what was causing the “CORS” error
+        print("AI ERROR:", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
