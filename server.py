@@ -127,46 +127,64 @@ Context: {req.sentence}
 
 
 
+class ExplainPassage(BaseModel):
+    work: str
+    section: str
+    speaker: Optional[str] = ""
+    greek: str
+    translation: Optional[str] = ""
+
+# --- endpoint ---
+
 @app.post("/ai/explain-passage")
-async def explain_passage(request: Request):
-    # 1. Parse JSON
-    body = await request.json()
+def explain_passage(req: ExplainPassage, request: Request):
+    try:
+        # 1. Pro check (identical to explain-word)
+        pro = request.headers.get("X-Pro-Token")
+        if not has_pro(pro):
+            raise HTTPException(status_code=402, detail="Pro required")
 
-    # 2. Extract fields (THIS is what you were asking)
-    work = body.get("work", "")
-    section = body.get("section", "")
-    speaker = body.get("speaker", "")
-    greek = body.get("greek", "")
-    translation = body.get("translation", "")
+        # 2. Prompt (philology-first, NOT summary)
+        prompt = f"""
+Explain this passage philologically.
+Do NOT summarize or paraphrase.
+Focus on syntax, structure, and argumentative flow.
+Explain why the Greek may be difficult to read.
 
-    # 3. Safety check
-    if not greek:
-        raise HTTPException(status_code=400, detail="Missing Greek text")
-
-    # 4. Pro check (copy from explain-word)
-    pro_token = request.headers.get("X-Pro-Token")
-    if not validate_pro_token(pro_token):
-        raise HTTPException(status_code=402, detail="Pro required")
-
-    # 5. Build prompt
-    prompt = f"""
-You are a classical philological commentator.
-
-Work: {work}
-Section: {section}
-Speaker: {speaker}
+Work: {req.work}
+Section: {req.section}
+Speaker: {req.speaker}
 
 Greek text:
-{greek}
+{req.greek}
 
 Translation (for reference only):
-{translation}
-
-Explain the syntax, structure, and argumentative flow.
-Do NOT summarize or paraphrase.
+{req.translation}
 """
 
-    # 6. Call the same AI function you already use
-    explanation = call_llm(prompt)
+        # 3. Same OpenAI call style
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a classical philologist."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=500,
+        )
 
-    return {"explanation": explanation}
+        return {
+            "explanation": r.choices[0].message.content.strip()
+        }
+
+    except HTTPException as e:
+        # preserve correct status codes like 402
+        raise e
+
+    except Exception as e:
+        # same defensive error handling as explain-word
+        print("AI ERROR (passage):", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
