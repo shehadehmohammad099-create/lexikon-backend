@@ -8,6 +8,27 @@ from pydantic import BaseModel
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
 from typing import Optional
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+DATABASE_URL = os.environ.get("postgres-production-02d6.up.railway.appL")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS pro_tokens (
+  token TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+)
+""")
+
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
+
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True
+cur = conn.cursor(cursor_factory=RealDictCursor)
+
 
 
 app = FastAPI()
@@ -43,8 +64,18 @@ def mint_pro_token():
     PRO_TOKENS.add(t)
     return t
 
-def has_pro(t):
-    return t in PRO_TOKENS
+def has_pro(pro_token: str | None) -> bool:
+    customer_id = customer_from_token(pro_token)
+    if not customer_id:
+        return False
+
+    subs = stripe.Subscription.list(
+        customer=customer_id,
+        status="active",
+        limit=1
+    )
+
+    return len(subs.data) > 0
 
 # -------------------------
 # MODELS
@@ -81,31 +112,44 @@ def create_checkout_session(request: Request):
     return {"url": session.url}
 
 # global store (you already have something like this)
-PRO_TOKENS = {}
+try:
+        session = stripe.checkout.Session.retrieve(session_id)
 
-@app.get("/checkout-success")
-def checkout_success(session_id: str):
-    session = stripe.checkout.Session.retrieve(session_id)
+        customer_id = session.customer
+        if not customer_id:
+            raise HTTPException(status_code=400, detail="Missing customer")
 
-    customer_id = session.customer
+        token = secrets.token_urlsafe(32)
 
-    token = secrets.token_urlsafe(32)
+        cur.execute(
+            "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+            (token, customer_id)
+        )
 
-    PRO_TOKENS[token] = {
-        "customer_id": customer_id
-    }
+        return {"pro_token": token}
 
-    return {"pro_token": token}
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+        print("CHECKOUT ERROR:", e)
+        return {"error": str(e)}
 
 def customer_from_token(pro_token: str | None):
     if not pro_token:
         return None
 
-    entry = PRO_TOKENS.get(pro_token)
-    if not entry:
-        return None
+    cur.execute(
+        "SELECT customer_id FROM pro_tokens WHERE token = %s",
+        (pro_token,)
+    )
 
-    return entry.get("customer_id")
+    row = cur.fetchone()
+    return row["customer_id"] if row else None
+
+
+
+
 
 
 # -------------------------
@@ -223,17 +267,13 @@ def create_portal_session(request: Request):
     customer_id = customer_from_token(pro)
 
     if not customer_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise HTTPException(status_code=401)
 
-    origin = request.headers.get("origin")
+    origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
 
-    # fallback for safety
-    if not origin:
-        origin = "https://the-lexicon-project.netlify.app"
-
-    session = stripe.billing_portal.Session.create(
+    portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}/frontend/static/app.html"
+        return_url=f"{origin}/static/app.html"
     )
 
-    return {"url": session.url}
+    return {"url": portal.url}
