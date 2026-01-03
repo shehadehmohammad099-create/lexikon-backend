@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
+from typing import Optional
 
 
 app = FastAPI()
