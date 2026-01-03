@@ -59,10 +59,7 @@ class ExplainWord(BaseModel):
 # -------------------------
 # STRIPE
 # -------------------------
-@app.options("/{path:path}")
-def options_handler(path: str):
-    return Response(status_code=200)
-    
+
 FRONTEND_URL = "https://frabjous-begonia-1cbd54.netlify.app"
 @app.get("/create-checkout-session")
 def create_checkout_session():
