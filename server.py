@@ -5,6 +5,8 @@ import openai
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.responses import Response
+
 
 app = FastAPI()
 
@@ -57,6 +59,10 @@ class ExplainWord(BaseModel):
 # -------------------------
 # STRIPE
 # -------------------------
+@app.options("/{path:path}")
+def options_handler(path: str):
+    return Response(status_code=200)
+    
 FRONTEND_URL = "https://frabjous-begonia-1cbd54.netlify.app"
 @app.get("/create-checkout-session")
 def create_checkout_session():
