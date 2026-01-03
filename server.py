@@ -323,24 +323,41 @@ def save_annotation(req: SaveAnnotation, request: Request):
     return {"ok": True}
 
 
-@app.get("/annotations")
-def get_annotations(work_id: str, section_id: str, request: Request):
+@app.post("/annotations")
+def save_annotation(req: SaveAnnotation, request: Request):
     pro = request.headers.get("X-Pro-Token")
     customer_id = customer_from_token(pro)
     if not customer_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise HTTPException(status_code=401)
 
+    # DELETE if empty
+    if not req.content.strip():
+        cur.execute("""
+        DELETE FROM annotations
+        WHERE customer_id = %s
+          AND work_id = %s
+          AND section_id = %s
+          AND token_id IS NOT DISTINCT FROM %s
+        """, (
+            customer_id,
+            req.work_id,
+            req.section_id,
+            req.token_id
+        ))
+        return {"deleted": True}
+
+    # Otherwise UPSERT
     cur.execute("""
-    SELECT token_id, content
-    FROM annotations
-    WHERE customer_id = %s AND work_id = %s AND section_id = %s
-    """, (customer_id, work_id, section_id))
+    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content)
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (customer_id, work_id, section_id, token_id)
+    DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
+    """, (
+        customer_id,
+        req.work_id,
+        req.section_id,
+        req.token_id,
+        req.content
+    ))
 
-    rows = cur.fetchall()
-
-    # Return as a dict keyed by token_id so frontend can apply markers fast
-    out = {}
-    for r in rows:
-        out[r["token_id"]] = r["content"]
-
-    return {"annotations": out}
+    return {"ok": True}
