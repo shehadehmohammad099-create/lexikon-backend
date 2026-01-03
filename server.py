@@ -18,6 +18,17 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://frabjous-begonia-1cbd54.netlify.app"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # -------------------------
 # TEMP PRO TOKENS (memory)
 # -------------------------
