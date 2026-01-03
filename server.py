@@ -303,7 +303,7 @@ class SaveAnnotation(BaseModel):
     work_id: str
     section_id: str
     token_id: Optional[str] = None  # word-level; can be null for passage-level later
-    content: str,
+    content: str
     visibility: Optional[str] = "private"
 
 @app.post("/annotations")
