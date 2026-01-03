@@ -80,13 +80,33 @@ def create_checkout_session(request: Request):
 
     return {"url": session.url}
 
+# global store (you already have something like this)
+PRO_TOKENS = {}
+
 @app.get("/checkout-success")
 def checkout_success(session_id: str):
     session = stripe.checkout.Session.retrieve(session_id)
-    if session.status != "complete":
-        raise HTTPException(400, "Payment not completed")
 
-    return {"pro_token": mint_pro_token()}
+    customer_id = session.customer
+
+    token = secrets.token_urlsafe(32)
+
+    PRO_TOKENS[token] = {
+        "customer_id": customer_id
+    }
+
+    return {"pro_token": token}
+
+def customer_from_token(pro_token: str | None):
+    if not pro_token:
+        return None
+
+    entry = PRO_TOKENS.get(pro_token)
+    if not entry:
+        return None
+
+    return entry.get("customer_id")
+
 
 # -------------------------
 # AI (PAID)
