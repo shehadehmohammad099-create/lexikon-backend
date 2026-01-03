@@ -112,28 +112,29 @@ def create_checkout_session(request: Request):
     return {"url": session.url}
 
 # global store (you already have something like this)
-    try:
-            session = stripe.checkout.Session.retrieve(session_id)
+try:
+    session = stripe.checkout.Session.retrieve(session_id)
 
-            customer_id = session.customer
-            if not customer_id:
-                raise HTTPException(status_code=400, detail="Missing customer")
+    customer_id = session.customer
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customer")
 
-            token = secrets.token_urlsafe(32)
+    token = secrets.token_urlsafe(32)
 
-            cur.execute(
-                "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
-                (token, customer_id)
-            )
+    cur.execute(
+        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+        (token, customer_id)
+    )
 
-            return {"pro_token": token}
+    return {"pro_token": token}
 
-        except HTTPException as e:
-            raise e
+except HTTPException as e:
+    raise e
 
-        except Exception as e:
-            print("CHECKOUT ERROR:", e)
-            return {"error": str(e)}
+except Exception as e:
+    print("CHECKOUT ERROR:", e)
+    return {"error": str(e)}
+    
 
 def customer_from_token(pro_token: str | None):
     if not pro_token:
