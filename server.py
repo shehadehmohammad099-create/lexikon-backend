@@ -77,18 +77,23 @@ FRONTEND_URL = "https://the-lexicon-project.netlify.app"
 def create_checkout_session(request: Request):
     origin = request.headers.get("origin")
 
-    # Fallback to prod if origin missing
+    # Fallback (prod)
     if not origin:
         origin = "https://the-lexicon-project.netlify.app"
+
+    # ALWAYS go to index.html
+    success_url = f"{origin}/index.html?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin}/index.html"
 
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=f"{origin}/?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{origin}/"
+        success_url=success_url,
+        cancel_url=cancel_url,
     )
 
     return {"url": session.url}
+
 
 
 @app.get("/checkout-success")
