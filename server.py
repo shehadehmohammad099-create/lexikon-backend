@@ -57,12 +57,13 @@ class ExplainWord(BaseModel):
 # -------------------------
 # STRIPE
 # -------------------------
+FRONTEND_URL = https://frabjous-begonia-1cbd54.netlify.app
 @app.get("/create-checkout-session")
 def create_checkout_session():
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=f"{FRONTEND_URL}?session_id={{CHECKOUT_SESSION_ID}}",
+        success_url=f"{FRONTEND_URL}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=FRONTEND_URL,
     )
     return {"url": session.url}
