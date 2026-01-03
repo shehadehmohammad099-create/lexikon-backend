@@ -11,7 +11,7 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DATABASE_URL = os.environ.get("postgres-production-02d6.up.railway.appL")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS pro_tokens (
