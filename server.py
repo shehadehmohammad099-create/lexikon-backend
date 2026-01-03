@@ -20,14 +20,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],            # for now
+    allow_credentials=False,        # IMPORTANT
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # -------------------------
 # TEMP PRO TOKENS (memory)
