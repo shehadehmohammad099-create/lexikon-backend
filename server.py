@@ -361,3 +361,28 @@ def save_annotation(req: SaveAnnotation, request: Request):
     ))
 
     return {"ok": True}
+
+@app.get("/annotations")
+def get_annotations(work_id: str, section_id: str, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+
+    if not customer_id:
+        raise HTTPException(status_code=401)
+
+    cur.execute("""
+    SELECT token_id, content
+    FROM annotations
+    WHERE customer_id = %s
+      AND work_id = %s
+      AND section_id = %s
+    """, (customer_id, work_id, section_id))
+
+    rows = cur.fetchall()
+
+    out = {}
+    for r in rows:
+        out[r["token_id"]] = r["content"]
+
+    return {"annotations": out}
+
