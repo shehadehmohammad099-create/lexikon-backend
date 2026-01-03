@@ -281,7 +281,7 @@ Translation (for reference only):
         )
 
 
-@app.post("/create-portal-session")
+@app.get("/create-portal-session")
 def create_portal_session(request: Request):
     pro = request.headers.get("X-Pro-Token")
     customer_id = customer_from_token(pro)
@@ -293,7 +293,7 @@ def create_portal_session(request: Request):
 
     portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}/frontend/static/app.html"
+        return_url=f"{origin}/static/app.html"
     )
 
     return {"url": portal.url}
