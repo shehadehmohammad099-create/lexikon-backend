@@ -7,14 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
-from typing import Optional
 
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # for now
+    allow_origins=["https://the-lexicon-project.netlify.app", "*"],            # for now
     allow_credentials=False,        # IMPORTANT
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,38 +62,15 @@ class ExplainWord(BaseModel):
 # -------------------------
     
 FRONTEND_URL = "https://the-lexicon-project.netlify.app"
-# @app.get("/create-checkout-session")
-# def create_checkout_session():
-#     session = stripe.checkout.Session.create(
-#         mode="subscription",
-#         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-#         success_url=f"{FRONTEND_URL}/static/confirmation.html?session_id={{CHECKOUT_SESSION_ID}}",
-#         cancel_url=FRONTEND_URL,
-#     )
-#     return {"url": session.url}
-
 @app.get("/create-checkout-session")
-def create_checkout_session(request: Request):
-    origin = request.headers.get("origin")
-
-    # Fallback (prod)
-    if not origin:
-        origin = "https://the-lexicon-project.netlify.app"
-
-    # ALWAYS go to index.html
-    success_url = f"{origin}/frontend/index.html?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{origin}/index.html"
-
+def create_checkout_session():
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
+        success_url=f"{FRONTEND_URL}/static/confirmation.html?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=FRONTEND_URL,
     )
-
     return {"url": session.url}
-
-
 
 @app.get("/checkout-success")
 def checkout_success(session_id: str):
@@ -144,70 +120,6 @@ Context: {req.sentence}
     except Exception as e:
         # THIS is what was causing the “CORS” error
         print("AI ERROR:", e)
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-
-
-
-class ExplainPassage(BaseModel):
-    work: str
-    section: str
-    speaker: Optional[str] = ""
-    greek: str
-    translation: Optional[str] = ""
-
-# --- endpoint ---
-
-@app.post("/ai/explain-passage")
-def explain_passage(req: ExplainPassage, request: Request):
-    try:
-        # 1. Pro check (identical to explain-word)
-        pro = request.headers.get("X-Pro-Token")
-        if not has_pro(pro):
-            raise HTTPException(status_code=402, detail="Pro required")
-
-        # 2. Prompt (philology-first, NOT summary)
-        prompt = f"""
-Explain this passage philologically.
-Do NOT summarize or paraphrase.
-Focus on syntax, structure, and argumentative flow.
-Explain why the Greek may be difficult to read.
-
-Work: {req.work}
-Section: {req.section}
-Speaker: {req.speaker}
-
-Greek text:
-{req.greek}
-
-Translation (for reference only):
-{req.translation}
-"""
-
-        # 3. Same OpenAI call style
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a classical philologist."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=500,
-        )
-
-        return {
-            "explanation": r.choices[0].message.content.strip()
-        }
-
-    except HTTPException as e:
-        # preserve correct status codes like 402
-        raise e
-
-    except Exception as e:
-        # same defensive error handling as explain-word
-        print("AI ERROR (passage):", e)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
