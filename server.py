@@ -13,7 +13,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://the-lexicon-project.netlify.app", "*"],            # for now
+    allow_origins=["https://the-lexicon-project.netlify.app"],            # for now
     allow_credentials=False,        # IMPORTANT
     allow_methods=["*"],
     allow_headers=["*"],
@@ -125,3 +125,48 @@ Context: {req.sentence}
             content={"error": str(e)}
         )
 
+
+
+@app.post("/ai/explain-passage")
+async def explain_passage(request: Request):
+    # 1. Parse JSON
+    body = await request.json()
+
+    # 2. Extract fields (THIS is what you were asking)
+    work = body.get("work", "")
+    section = body.get("section", "")
+    speaker = body.get("speaker", "")
+    greek = body.get("greek", "")
+    translation = body.get("translation", "")
+
+    # 3. Safety check
+    if not greek:
+        raise HTTPException(status_code=400, detail="Missing Greek text")
+
+    # 4. Pro check (copy from explain-word)
+    pro_token = request.headers.get("X-Pro-Token")
+    if not validate_pro_token(pro_token):
+        raise HTTPException(status_code=402, detail="Pro required")
+
+    # 5. Build prompt
+    prompt = f"""
+You are a classical philological commentator.
+
+Work: {work}
+Section: {section}
+Speaker: {speaker}
+
+Greek text:
+{greek}
+
+Translation (for reference only):
+{translation}
+
+Explain the syntax, structure, and argumentative flow.
+Do NOT summarize or paraphrase.
+"""
+
+    # 6. Call the same AI function you already use
+    explanation = call_llm(prompt)
+
+    return {"explanation": explanation}
