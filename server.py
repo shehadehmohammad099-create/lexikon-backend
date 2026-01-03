@@ -283,20 +283,14 @@ Translation (for reference only):
 
 @app.get("/create-portal-session")
 def create_portal_session(request: Request):
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
-
-    if not customer_id:
-        raise HTTPException(status_code=401)
-
     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
 
     portal = stripe.billing_portal.Session.create(
-        customer=customer_id,
-        return_url=f"{origin}/static/app.html"
+        return_url=f"{origin}/static/app.html?restore=1"
     )
 
     return {"url": portal.url}
+
 
 
 class SaveAnnotation(BaseModel):
