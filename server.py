@@ -61,7 +61,7 @@ class ExplainWord(BaseModel):
 # STRIPE
 # -------------------------
     
-FRONTEND_URL = "https://frabjous-begonia-1cbd54.netlify.app"
+FRONTEND_URL = "https://the-lexicon-project.netlify.app"
 @app.get("/create-checkout-session")
 def create_checkout_session():
     session = stripe.checkout.Session.create(
