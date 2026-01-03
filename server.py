@@ -387,3 +387,22 @@ def get_annotations(work_id: str, section_id: str, request: Request):
 
     return {"annotations": out}
 
+
+
+@app.get("/annotations/public")
+def get_public_annotations(work_id: str, section_id: str):
+    cur.execute("""
+    SELECT token_id, content
+    FROM annotations
+    WHERE work_id = %s
+      AND section_id = %s
+      AND visibility = 'public'
+    """, (work_id, section_id))
+
+    rows = cur.fetchall()
+
+    out = {}
+    for r in rows:
+        out[r["token_id"]] = r["content"]
+
+    return {"annotations": out}
