@@ -185,7 +185,7 @@ def send_restore_email(to_email: str, restore_url: str):
             "Content-Type": "application/json",
         },
         json={
-            "from": "Lexikon <restore@lexikon.app>",
+            "from": "shehadehmohammad099@gmail.com",
             "to": to_email,
             "subject": "Restore your Lexikon subscription",
             "html": f"""
