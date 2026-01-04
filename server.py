@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from fastapi import Body
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
