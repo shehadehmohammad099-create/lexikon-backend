@@ -11,6 +11,8 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import Body
+import requests
+
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -136,7 +138,33 @@ def create_checkout_session(request: Request):
 
     return {"url": session.url}
 
-@app.get("/checkout-success")
+    def send_restore_email(to_email: str, restore_url: str):
+    requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": "Lexikon <restore@lexikon.app>",
+            "to": to_email,
+            "subject": "Restore your Lexikon subscription",
+            "html": f"""
+              <p>You can restore your Lexikon Pro access by clicking the link below:</p>
+
+              <p>
+                <a href="{restore_url}">
+                  Restore my subscription
+                </a>
+              </p>
+
+              <p>This link can be used once and will expire.</p>
+            """
+        },
+        timeout=5,
+    )
+
+
 @app.get("/checkout-success")
 def checkout_success(session_id: str, request: Request):
     session = stripe.checkout.Session.retrieve(
@@ -174,6 +202,15 @@ def checkout_success(session_id: str, request: Request):
     print("RESTORE LINK:", restore_url)
 
     return {"pro_token": pro_token}
+
+    email = session.customer.email
+
+    restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
+
+    if email:
+        send_restore_email(email, restore_url)
+
+
 
     session = stripe.checkout.Session.retrieve(
         session_id,
