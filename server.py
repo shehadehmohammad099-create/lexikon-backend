@@ -318,7 +318,11 @@ def restore_subscription(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Email required")
 
     # 1. Find Stripe customer by email
-    customers = stripe.Customer.list(email=email, limit=1).data
+    customers = stripe.Customer.search(
+        query=f"email:'{email}'",
+        limit=1
+    ).data
+
     if not customers:
         raise HTTPException(status_code=404, detail="No customer found")
 
