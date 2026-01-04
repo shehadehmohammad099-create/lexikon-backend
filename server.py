@@ -134,7 +134,7 @@ def create_checkout_session(request: Request):
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         billing_address_collection="required",
-        success_url=f"{origin}/frontend/static/app.html?session_id={{CHECKOUT_SESSION_ID}}",
+        success_url=f"{origin}/static/app.html?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{origin}/index.html",
     )
 
@@ -250,7 +250,7 @@ def checkout_success(session_id: str, request: Request):
         """, (restore_token, customer_id, expires_at))
 
         origin = request.headers.get("origin") or FRONTEND_URL
-        restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
+        restore_url = f"{origin}/app.html?restore_token={restore_token}"
 
         print("RESTORE LINK:", restore_url)
         print("CHECKOUT EMAIL:", email)
@@ -404,7 +404,7 @@ Translation (for reference only):
 #     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
 
 #     portal = stripe.billing_portal.Session.create(
-#         return_url=f"{origin}/static/app.html?restore=1"
+#         return_url=f"{origin}//static/app.html?restore=1"
 #     )
 
 #     return {"url": portal.url}
@@ -464,7 +464,7 @@ def billing_portal(request: Request):
 
     portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}/static/app.html"
+        return_url=f"{origin}//static/app.html"
     )
 
     return {"url": portal.url}
