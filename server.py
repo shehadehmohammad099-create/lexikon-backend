@@ -140,6 +140,42 @@ def create_checkout_session(request: Request):
 
     return {"url": session.url}
 
+
+STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+
+        customer_id = session["customer"]
+        email = session["customer_details"]["email"]
+
+        # mint restore token
+        restore_token = secrets.token_urlsafe(32)
+        expires_at = datetime.utcnow() + timedelta(days=7)
+
+        cur.execute("""
+            INSERT INTO restore_tokens (token, customer_id, expires_at)
+            VALUES (%s, %s, %s)
+        """, (restore_token, customer_id, expires_at))
+
+        restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+
+        send_restore_email(email, restore_url)
+
+    return {"ok": True}
+
 def send_restore_email(to_email: str, restore_url: str):
     requests.post(
         "https://api.resend.com/emails",
