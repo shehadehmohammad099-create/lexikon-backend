@@ -553,6 +553,12 @@ def save_annotation(req: SaveAnnotation, request: Request):
     if not customer_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # Only Pro users can make annotations public
+    # Force visibility to private if user is not Pro
+    visibility = req.visibility or "private"
+    if visibility == "public" and not has_pro(pro):
+        visibility = "private"
+
     # DELETE if empty
     if not req.content.strip():
         cur.execute("""
@@ -575,7 +581,7 @@ def save_annotation(req: SaveAnnotation, request: Request):
     VALUES (%s, %s, %s, %s, %s, %s)
     ON CONFLICT (customer_id, work_id, section_id, token_id)
     DO UPDATE SET content = EXCLUDED.content, visibility = EXCLUDED.visibility, updated_at = NOW()
-    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, req.visibility))
+    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, visibility))
 
     return {"ok": True}
 
@@ -586,23 +592,29 @@ def get_annotations(work_id: str, section_id: str, request: Request):
     customer_id = customer_from_token(pro)
 
     if not customer_id:
-        raise HTTPException(status_code=401)
+        # Return empty annotations instead of 401 - allows graceful fallback to local
+        return {"annotations": {}}
 
-    cur.execute("""
-    SELECT token_id, content
-    FROM annotations
-    WHERE customer_id = %s
-      AND work_id = %s
-      AND section_id = %s
-    """, (customer_id, work_id, section_id))
+    try:
+        cur.execute("""
+        SELECT token_id, content
+        FROM annotations
+        WHERE customer_id = %s
+          AND work_id = %s
+          AND section_id = %s
+        """, (customer_id, work_id, section_id))
 
-    rows = cur.fetchall()
+        rows = cur.fetchall()
 
-    out = {}
-    for r in rows:
-        out[r["token_id"]] = r["content"]
+        out = {}
+        for r in rows:
+            if r and "token_id" in r and "content" in r:
+                out[r["token_id"]] = r["content"]
 
-    return {"annotations": out}
+        return {"annotations": out}
+    except Exception as e:
+        print(f"Error fetching annotations: {e}")
+        return {"annotations": {}}
 
 
 
@@ -630,19 +642,23 @@ def search_annotations(q: str, request: Request):
     pro = request.headers.get("X-Pro-Token")
     customer_id = customer_from_token(pro)
     if not customer_id:
-        raise HTTPException(status_code=401)
+        return {"results": []}
 
-    cur.execute("""
-    SELECT work_id, section_id, token_id, content
-    FROM annotations
-    WHERE customer_id = %s
-      AND content ILIKE %s
-    ORDER BY updated_at DESC
-    LIMIT 50
-    """, (customer_id, f"%{q}%"))
+    try:
+        cur.execute("""
+        SELECT work_id, section_id, token_id, content
+        FROM annotations
+        WHERE customer_id = %s
+          AND content ILIKE %s
+        ORDER BY updated_at DESC
+        LIMIT 50
+        """, (customer_id, f"%{q}%"))
 
-    rows = cur.fetchall()
-    return {"results": rows}
+        rows = cur.fetchall()
+        return {"results": rows if rows else []}
+    except Exception as e:
+        print(f"Error searching annotations: {e}")
+        return {"results": []}
 
 
 @app.get("/restore-pro")
