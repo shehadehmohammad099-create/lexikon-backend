@@ -303,6 +303,7 @@ Translation (for reference only):
 from datetime import datetime, timedelta
 @app.post("/billing/request-restore")
 async def request_restore(request: Request):
+    print("HIT")
     payload = await request.json()
     email = payload.get("email")
 
@@ -319,7 +320,7 @@ async def request_restore(request: Request):
         return {"ok": True}
 
     customer_id = customers[0].id
-
+    print("CUSTOMERS FOUND:", len(customers))
     restore_token = secrets.token_urlsafe(32)
     expires_at = datetime.utcnow() + timedelta(minutes=15)
 
