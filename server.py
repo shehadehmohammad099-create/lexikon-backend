@@ -395,8 +395,7 @@ def billing_portal(request: Request):
     return {"url": portal.url}
 
 
-@app.post("/billing/restore")
-def restore_subscription(payload: dict = Body(...)):
+
     email = payload.get("email")
 
     if not email:
