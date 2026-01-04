@@ -797,16 +797,12 @@ async def upload_text(
     title: str = Form(...),
     language: str = Form(...)  # "en", "grc", "la"
 ):
-    """Upload and process a text file."""
+    """Upload and process a text file. Processing is free for all users.
+    Cloud storage is only for Pro users; all users get the processed result
+    to save in localStorage."""
     
-    # Get user identifier
+    # Get user identifier (may be None for non-Pro users)
     user_id = get_user_id(request)
-    
-    if not user_id:
-        raise HTTPException(
-            status_code=401, 
-            detail="Authentication required. Please sign in or enable anonymous ID."
-        )
     
     # Read file
     try:
@@ -838,7 +834,8 @@ async def upload_text(
     
     # Process text
     try:
-        print(f"📝 Processing {word_count} words in {language} for user {user_id[:20]}...")
+        user_display = (user_id[:20] + "...") if user_id else "anonymous"
+        print(f"📝 Processing {word_count} words in {language} for user {user_display}...")
         sections = process_text_with_stanza(text, language)
         print(f"✅ Created {len(sections)} sections")
     except Exception as e:
@@ -848,20 +845,54 @@ async def upload_text(
     # Generate unique ID for this text
     text_id = f"user_{secrets.token_urlsafe(12)}"
     
-    # Save to database
-    with get_db() as cur:
-        cur.execute("""
-        INSERT INTO user_texts (id, user_id, title, language, sections)
-        VALUES (%s, %s, %s, %s, %s)
-        """, (text_id, user_id, title, language, Json(sections)))
+    # Save to database (only for Pro users)
+    if user_id:
+        with get_db() as cur:
+            cur.execute("""
+            INSERT INTO user_texts (id, user_id, title, language, sections)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                sections = EXCLUDED.sections
+            """, (text_id, user_id, title, language, Json(sections)))
     
+    # Return sections so frontend can save to localStorage
     return {
         "id": text_id,
         "title": title,
         "language": language,
+        "sections": sections,
         "section_count": len(sections),
         "word_count": word_count
     }
+
+
+class SaveTextRequest(BaseModel):
+    id: str
+    title: str
+    language: str
+    sections: List[dict]
+
+
+@app.post("/texts/save")
+def save_text(req: SaveTextRequest, request: Request):
+    """Save a pre-processed text to cloud (for migration/sync). Pro only."""
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Pro subscription required")
+    
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO user_texts (id, user_id, title, language, sections)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            title = EXCLUDED.title,
+            sections = EXCLUDED.sections
+        """, (req.id, customer_id, req.title, req.language, Json(req.sections)))
+    
+    return {"ok": True}
 
 
 @app.get("/texts")
