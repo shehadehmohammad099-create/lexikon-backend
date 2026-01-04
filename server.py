@@ -137,7 +137,44 @@ def create_checkout_session(request: Request):
     return {"url": session.url}
 
 @app.get("/checkout-success")
-def checkout_success(session_id: str):
+@app.get("/checkout-success")
+def checkout_success(session_id: str, request: Request):
+    session = stripe.checkout.Session.retrieve(
+        session_id,
+        expand=["customer"]
+    )
+
+    customer_id = session.customer.id
+    email = session.customer.email
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customer")
+
+    # Issue Pro token
+    pro_token = secrets.token_urlsafe(32)
+    cur.execute(
+        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+        (pro_token, customer_id)
+    )
+
+    # Restore token
+    restore_token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=7)
+
+    cur.execute("""
+        INSERT INTO restore_tokens (token, customer_id, expires_at)
+        VALUES (%s, %s, %s)
+    """, (restore_token, customer_id, expires_at))
+
+    # 🔑 THIS IS THE IMPORTANT PART
+    origin = request.headers.get("origin") or FRONTEND_URL
+
+    restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
+
+    print("RESTORE LINK:", restore_url)
+
+    return {"pro_token": pro_token}
+
     session = stripe.checkout.Session.retrieve(
         session_id,
         expand=["customer"]
