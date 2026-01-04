@@ -277,13 +277,19 @@ def customer_from_token(pro_token: str | None):
     if not pro_token:
         return None
 
-    cur.execute(
-        "SELECT customer_id FROM pro_tokens WHERE token = %s",
-        (pro_token,)
-    )
+    try:
+        cur.execute(
+            "SELECT customer_id FROM pro_tokens WHERE token = %s",
+            (pro_token,)
+        )
 
-    row = cur.fetchone()
-    return row["customer_id"] if row else None
+        row = cur.fetchone()
+        if row and "customer_id" in row:
+            return row["customer_id"]
+        return None
+    except Exception as e:
+        print(f"Error in customer_from_token: {e}")
+        return None
 
 
 
