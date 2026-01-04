@@ -218,7 +218,7 @@ def send_restore_email(to_email: str, restore_url: str):
                 "Content-Type": "application/json",
             },
             json={
-                "from": "Lexikon <onboarding@resend.dev>",
+                "from": "shehadehmohammad099@gmail.com",
                 "to": to_email,
                 "subject": "Restore your Lexikon subscription",
                 "html": f"""
@@ -330,11 +330,11 @@ def checkout_success(session_id: str, request: Request):
         print("RESTORE LINK:", restore_url)
         print("CHECKOUT EMAIL:", email)
 
-        if email:
-            print(f"📧 Attempting to send restore email to {email}...")
-            send_restore_email(email, restore_url)
-        else:
-            print("⚠️ No email found, skipping restore email")
+        # if email:
+        #     print(f"📧 Attempting to send restore email to {email}...")
+        #     send_restore_email(email, restore_url)
+        # else:
+        #     print("⚠️ No email found, skipping restore email")
 
         return {"pro_token": pro_token}
 
