@@ -405,6 +405,56 @@ Translation (for reference only):
         )
 
 
+@app.post("/billing/request-restore")
+async def request_restore(request: Request):
+    payload = await request.json()
+    email = payload.get("email")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    # Find Stripe customer by email
+    customers = stripe.Customer.search(
+        query=f"email:'{email}'",
+        limit=1
+    ).data
+
+    if not customers:
+        # Don't reveal whether email exists (security)
+        print(f"⚠️ No customer found for {email}")
+        return {"ok": True}
+
+    customer = customers[0]
+
+    # Check for active subscription
+    subs = stripe.Subscription.list(
+        customer=customer.id,
+        status="active",
+        limit=1
+    ).data
+
+    if not subs:
+        print(f"⚠️ No active subscription for {email}")
+        # Still return ok to not leak info
+        return {"ok": True}
+
+    # Create restore token
+    restore_token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=7)
+
+    cur.execute("""
+        INSERT INTO restore_tokens (token, customer_id, expires_at)
+        VALUES (%s, %s, %s)
+    """, (restore_token, customer.id, expires_at))
+
+    restore_url = f"{FRONTEND_URL}/static/app.html?restore_token={restore_token}"
+
+    print(f"📧 Sending restore email to {email}...")
+    send_restore_email(email, restore_url)
+
+    return {"ok": True}
+
+
 @app.post("/billing/restore-from-link")
 async def restore_from_link(request: Request):
     payload = await request.json()
