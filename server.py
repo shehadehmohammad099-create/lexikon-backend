@@ -204,6 +204,7 @@ def checkout_success(session_id: str, request: Request):
     return {"pro_token": pro_token}
 
     email = session.customer.email
+    print("CHECKOUT EMAIL:", email)
 
     restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
 
