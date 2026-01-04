@@ -309,25 +309,39 @@ def billing_portal(request: Request):
     return {"url": portal.url}
 
 
-@app.get("/billing/restore")
-def billing_restore(request: Request):
-    origin = request.headers.get("origin") or "http://localhost:5500"
+@app.route("/billing/restore", methods=["POST"])
+def restore_subscription():
+    data = request.get_json(force=True)
+    email = data.get("email")
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        subscription_data={
-            "trial_settings": {
-                "end_behavior": {
-                    "missing_payment_method": "cancel"
-                }
-            }
-        },
-        success_url=f"{origin}/frontend/static/app.html?restore_session={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{origin}/frontend/static/app.html",
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    # 1. Find Stripe customer by email
+    customers = stripe.Customer.list(email=email, limit=1).data
+    if not customers:
+        return jsonify({"error": "No customer found"}), 404
+
+    customer = customers[0]
+
+    # 2. Check for active subscription
+    subs = stripe.Subscription.list(
+        customer=customer.id,
+        status="active",
+        limit=1
+    ).data
+
+    if not subs:
+        return jsonify({"error": "No active subscription"}), 402
+
+    # 3. Mint a new Pro token (YOU ALREADY HAVE THIS)
+    pro_token = mint_pro_token(
+        stripe_customer_id=customer.id
     )
 
-    return {"url": session.url}
+    return jsonify({
+        "pro_token": pro_token
+    })
 
 
 
