@@ -76,7 +76,7 @@ app.add_middleware(
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
-FRONTEND_URL = os.environ["FRONTEND_URL"]  # e.g. https://lexikon.netlify.app/app.html
+FRONTEND_URL = os.environ["FRONTEND_URL"]  # e.g. https://the-lexicon-project.netlify.app
 
 openai.api_key = OPENAI_API_KEY
 stripe.api_key = STRIPE_SECRET_KEY
@@ -134,7 +134,7 @@ def create_checkout_session(request: Request):
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         billing_address_collection="required",
-        success_url=f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
+        success_url=f"{origin}/static/app.html?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{origin}/index.html",
     )
 
@@ -171,7 +171,7 @@ async def stripe_webhook(request: Request):
             VALUES (%s, %s, %s)
         """, (restore_token, customer_id, expires_at))
 
-        restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+        restore_url = f"{FRONTEND_URL}/static/app.html?restore_token={restore_token}"
 
         send_restore_email(email, restore_url)
 
@@ -250,7 +250,7 @@ def checkout_success(session_id: str, request: Request):
         """, (restore_token, customer_id, expires_at))
 
         origin = request.headers.get("origin") or FRONTEND_URL
-        restore_url = f"{origin}/app.html?restore_token={restore_token}"
+        restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
 
         print("RESTORE LINK:", restore_url)
         print("CHECKOUT EMAIL:", email)
@@ -328,7 +328,7 @@ Context: {req.sentence}
         raise e
 
     except Exception as e:
-        # THIS is what was causing the “CORS” error
+        # THIS is what was causing the "CORS" error
         print("AI ERROR:", e)
         return JSONResponse(
             status_code=500,
@@ -399,17 +399,6 @@ Translation (for reference only):
         )
 
 
-# @app.get("/create-portal-session")
-# def create_portal_session(request: Request):
-#     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
-
-#     portal = stripe.billing_portal.Session.create(
-#         return_url=f"{origin}//static/app.html?restore=1"
-#     )
-
-#     return {"url": portal.url}
-
-
 @app.post("/billing/restore-from-link")
 async def restore_from_link(request: Request):
     payload = await request.json()
@@ -464,7 +453,7 @@ def billing_portal(request: Request):
 
     portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}//app.html"
+        return_url=f"{origin}/static/app.html"
     )
 
     return {"url": portal.url}
