@@ -178,30 +178,40 @@ async def stripe_webhook(request: Request):
     return {"ok": True}
 
 def send_restore_email(to_email: str, restore_url: str):
-    requests.post(
-        "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "from": "onboarding@resend.dev",
-            "to": to_email,
-            "subject": "Restore your Lexikon subscription",
-            "html": f"""
-                <p>You can restore your Lexikon Pro access by clicking the link below:</p>
+    try:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Lexikon <restore@lexikon.app>",
+                "to": to_email,
+                "subject": "Restore your Lexikon subscription",
+                "html": f"""
+                    <p>You can restore your Lexikon Pro access by clicking the link below:</p>
 
-                <p>
-                <a href="{restore_url}">
-                    Restore my subscription
-                </a>
-                </p>
+                    <p>
+                    <a href="{restore_url}">
+                        Restore my subscription
+                    </a>
+                    </p>
 
-                <p>This link can be used once and will expire.</p>
-            """
-        },
-        timeout=5,
-    )
+                    <p>This link can be used once and will expire.</p>
+                """
+            },
+            timeout=5,
+        )
+        
+        # Log the result
+        if response.ok:
+            print(f"✅ Restore email sent to {to_email}")
+        else:
+            print(f"❌ Resend API error: {response.status_code} - {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Failed to send restore email: {e}")
 
 
 @app.get("/checkout-success")
@@ -247,7 +257,10 @@ def checkout_success(session_id: str, request: Request):
 
         # Send restore email if we have an email
         if email:
+            print(f"📧 Attempting to send restore email to {email}...")
             send_restore_email(email, restore_url)
+        else:
+            print("⚠️ No email found, skipping restore email")
 
         return {"pro_token": pro_token}
 
