@@ -340,38 +340,6 @@ def restore_subscription(payload: dict = Body(...)):
         "pro_token": pro_token
     }
 
-    data = request.get_json(force=True)
-    email = data.get("email")
-
-    if not email:
-        return jsonify({"error": "Email required"}), 400
-
-    # 1. Find Stripe customer by email
-    customers = stripe.Customer.list(email=email, limit=1).data
-    if not customers:
-        return jsonify({"error": "No customer found"}), 404
-
-    customer = customers[0]
-
-    # 2. Check for active subscription
-    subs = stripe.Subscription.list(
-        customer=customer.id,
-        status="active",
-        limit=1
-    ).data
-
-    if not subs:
-        return jsonify({"error": "No active subscription"}), 402
-
-    # 3. Mint a new Pro token (YOU ALREADY HAVE THIS)
-    pro_token = mint_pro_token(
-        stripe_customer_id=customer.id
-    )
-
-    return jsonify({
-        "pro_token": pro_token
-    })
-
 
 
 
