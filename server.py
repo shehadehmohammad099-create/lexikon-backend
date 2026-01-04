@@ -335,75 +335,75 @@ Translation (for reference only):
 from datetime import datetime, timedelta
 # @app.post("/billing/request-restore")
 # async def request_restore(request: Request):
-    print("HIT")
-    payload = await request.json()
-    email = payload.get("email")
+    # print("HIT")
+    # payload = await request.json()
+    # email = payload.get("email")
 
-    if not email:
-        # Always succeed to avoid email enumeration
-        return {"ok": True}
+    # if not email:
+    #     # Always succeed to avoid email enumeration
+    #     return {"ok": True}
 
-    customers = stripe.Customer.search(
-        query=f"email:'{email}'",
-        limit=1
-    ).data
+    # customers = stripe.Customer.search(
+    #     query=f"email:'{email}'",
+    #     limit=1
+    # ).data
 
-    if not customers:
-        return {"ok": True}
+    # if not customers:
+    #     return {"ok": True}
 
-    customer_id = customers[0].id
-    print("CUSTOMERS FOUND:", len(customers))
-    restore_token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(minutes=15)
+    # customer_id = customers[0].id
+    # print("CUSTOMERS FOUND:", len(customers))
+    # restore_token = secrets.token_urlsafe(32)
+    # expires_at = datetime.utcnow() + timedelta(minutes=15)
 
-    cur.execute("""
-        INSERT INTO restore_tokens (token, customer_id, expires_at)
-        VALUES (%s, %s, %s)
-    """, (restore_token, customer_id, expires_at))
+    # cur.execute("""
+    #     INSERT INTO restore_tokens (token, customer_id, expires_at)
+    #     VALUES (%s, %s, %s)
+    # """, (restore_token, customer_id, expires_at))
 
-    restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+    # restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
 
-    # DEV MODE: log instead of email
-    print("RESTORE LINK:", restore_url)
+    # # DEV MODE: log instead of email
+    # print("RESTORE LINK:", restore_url)
 
-    return {"ok": True}
+    # return {"ok": True}
 
-    email = payload.get("email")
-    if not email:
-        raise HTTPException(status_code=400, detail="Email required")
+    # email = payload.get("email")
+    # if not email:
+    #     raise HTTPException(status_code=400, detail="Email required")
 
-    # 🔹 IMPORTANT: use Stripe SEARCH (best we can do here)
-    customers = stripe.Customer.search(
-        query=f"email:'{email}'",
-        limit=1
-    ).data
+    # # 🔹 IMPORTANT: use Stripe SEARCH (best we can do here)
+    # customers = stripe.Customer.search(
+    #     query=f"email:'{email}'",
+    #     limit=1
+    # ).data
 
-    if not customers:
-        # Do NOT leak info
-        return {"ok": True}
+    # if not customers:
+    #     # Do NOT leak info
+    #     return {"ok": True}
 
-    customer_id = customers[0].id
+    # customer_id = customers[0].id
 
-    restore_token = secrets.token_urlsafe(32)
-    expires = datetime.utcnow() + timedelta(minutes=15)
+    # restore_token = secrets.token_urlsafe(32)
+    # expires = datetime.utcnow() + timedelta(minutes=15)
 
-    cur.execute("""
-        INSERT INTO restore_tokens (token, customer_id, expires_at)
-        VALUES (%s, %s, %s)
-    """, (restore_token, customer_id, expires))
+    # cur.execute("""
+    #     INSERT INTO restore_tokens (token, customer_id, expires_at)
+    #     VALUES (%s, %s, %s)
+    # """, (restore_token, customer_id, expires))
 
-    restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+    # restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
 
-    # 🔹 SEND EMAIL HERE
-    # send_email(
-    #   to=email,
-    #   subject="Restore your Lexikon subscription",
-    #   body=f"Click to restore: {restore_url}"
-    # )
+    # # 🔹 SEND EMAIL HERE
+    # # send_email(
+    # #   to=email,
+    # #   subject="Restore your Lexikon subscription",
+    # #   body=f"Click to restore: {restore_url}"
+    # # )
 
-    print("RESTORE LINK:", restore_url)  # dev-only
+    # print("RESTORE LINK:", restore_url)  # dev-only
 
-    return {"ok": True}
+    # return {"ok": True}
 
 @app.post("/billing/restore-from-link")
 async def restore_from_link(request: Request):
