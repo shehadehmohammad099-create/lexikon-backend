@@ -5,3 +5,4 @@ openai==0.28.1
 pydantic
 psycopg2-binary
 stanza>=1.5.0
+python-multipart>=0.0.6
