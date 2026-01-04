@@ -301,9 +301,40 @@ Translation (for reference only):
 
 
 from datetime import datetime, timedelta
-
 @app.post("/billing/request-restore")
-def request_restore(payload: dict = Body(...)):
+async def request_restore(request: Request):
+    payload = await request.json()
+    email = payload.get("email")
+
+    if not email:
+        # Always succeed to avoid email enumeration
+        return {"ok": True}
+
+    customers = stripe.Customer.search(
+        query=f"email:'{email}'",
+        limit=1
+    ).data
+
+    if not customers:
+        return {"ok": True}
+
+    customer_id = customers[0].id
+
+    restore_token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    cur.execute("""
+        INSERT INTO restore_tokens (token, customer_id, expires_at)
+        VALUES (%s, %s, %s)
+    """, (restore_token, customer_id, expires_at))
+
+    restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+
+    # DEV MODE: log instead of email
+    print("RESTORE LINK:", restore_url)
+
+    return {"ok": True}
+
     email = payload.get("email")
     if not email:
         raise HTTPException(status_code=400, detail="Email required")
@@ -342,7 +373,47 @@ def request_restore(payload: dict = Body(...)):
     return {"ok": True}
 
 @app.post("/billing/restore-from-link")
-def restore_from_link(payload: dict = Body(...)):
+async def restore_from_link(request: Request):
+    payload = await request.json()
+    token = payload.get("restore_token")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing token")
+
+    cur.execute("""
+        SELECT customer_id
+        FROM restore_tokens
+        WHERE token = %s
+          AND expires_at > NOW()
+    """, (token,))
+
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+    customer_id = row["customer_id"]
+
+    subs = stripe.Subscription.list(
+        customer=customer_id,
+        status="active",
+        limit=1
+    ).data
+
+    if not subs:
+        raise HTTPException(status_code=402, detail="No active subscription")
+
+    pro_token = secrets.token_urlsafe(32)
+
+    cur.execute(
+        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+        (pro_token, customer_id)
+    )
+
+    # One-time use
+    cur.execute("DELETE FROM restore_tokens WHERE token = %s", (token,))
+
+    return {"pro_token": pro_token}
+
     token = payload.get("restore_token")
     if not token:
         raise HTTPException(status_code=400)
