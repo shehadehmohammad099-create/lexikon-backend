@@ -718,17 +718,20 @@ def restore_pro(session_id: str):
 # USER TEXT IMPORT ENDPOINTS
 # -------------------------
 
-def get_user_id(request: Request) -> str:
-    """Get user ID from pro token, or generate anonymous ID from IP."""
+def get_user_id(request: Request) -> str | None:
+    """Get user ID from pro token, or from X-Anon-ID header for non-pro users."""
+    # First try pro token
     pro = request.headers.get("X-Pro-Token")
     customer_id = customer_from_token(pro)
     if customer_id:
         return customer_id
     
-    # For non-pro users, use a hash of their IP as a simple identifier
-    # This isn't perfect but allows basic text storage without auth
-    client_ip = request.client.host if request.client else "unknown"
-    return f"anon_{secrets.token_urlsafe(8)}_{hash(client_ip) % 10000}"
+    # Fall back to anonymous ID from header (generated and stored client-side)
+    anon_id = request.headers.get("X-Anon-ID")
+    if anon_id and anon_id.startswith("anon_"):
+        return anon_id
+    
+    return None
 
 
 def process_text_with_stanza(text: str, language: str) -> List[dict]:
@@ -799,6 +802,12 @@ async def upload_text(
     # Get user identifier
     user_id = get_user_id(request)
     
+    if not user_id:
+        raise HTTPException(
+            status_code=401, 
+            detail="Authentication required. Please sign in or enable anonymous ID."
+        )
+    
     # Read file
     try:
         content = await file.read()
@@ -860,13 +869,8 @@ def list_user_texts(request: Request):
     """List all texts uploaded by the current user."""
     user_id = get_user_id(request)
     
-    # For anonymous users, they won't have persistent access
-    # Only pro token users get reliable text listing
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
-    
-    if not customer_id:
-        return {"texts": [], "message": "Sign in to save and access your texts"}
+    if not user_id:
+        return {"texts": [], "message": "No user ID provided"}
     
     with get_db() as cur:
         cur.execute("""
@@ -875,7 +879,7 @@ def list_user_texts(request: Request):
         FROM user_texts
         WHERE user_id = %s
         ORDER BY created_at DESC
-        """, (customer_id,))
+        """, (user_id,))
         
         rows = cur.fetchall()
         
@@ -895,8 +899,7 @@ def list_user_texts(request: Request):
 @app.get("/texts/{text_id}")
 def get_user_text(text_id: str, request: Request):
     """Get a specific user text with all sections."""
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
+    user_id = get_user_id(request)
     
     with get_db() as cur:
         cur.execute("""
@@ -911,8 +914,11 @@ def get_user_text(text_id: str, request: Request):
             raise HTTPException(status_code=404, detail="Text not found")
         
         # Check ownership (only owner can access)
-        if customer_id and row["user_id"] != customer_id:
+        if user_id and row["user_id"] != user_id:
             raise HTTPException(status_code=403, detail="Access denied")
+        
+        # If no user_id provided, still allow access if they know the text_id
+        # (useful for sharing links in the future)
         
         return {
             "id": row["id"],
@@ -925,10 +931,9 @@ def get_user_text(text_id: str, request: Request):
 @app.delete("/texts/{text_id}")
 def delete_user_text(text_id: str, request: Request):
     """Delete a user text."""
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
+    user_id = get_user_id(request)
     
-    if not customer_id:
+    if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
     
     with get_db() as cur:
@@ -942,7 +947,7 @@ def delete_user_text(text_id: str, request: Request):
         if not row:
             raise HTTPException(status_code=404, detail="Text not found")
         
-        if row["user_id"] != customer_id:
+        if row["user_id"] != user_id:
             raise HTTPException(status_code=403, detail="Access denied")
         
         # Delete
@@ -951,6 +956,6 @@ def delete_user_text(text_id: str, request: Request):
         # Also delete any annotations for this text
         cur.execute("""
         DELETE FROM annotations WHERE work_id = %s AND customer_id = %s
-        """, (text_id, customer_id))
+        """, (text_id, user_id))
     
     return {"ok": True}
