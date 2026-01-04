@@ -47,6 +47,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS annotations_unique
 ON annotations (customer_id, work_id, section_id, token_id)
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS restore_tokens (
+  token TEXT PRIMARY KEY,
+  customer_id TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL
+)
+""")
 
 
 
@@ -291,6 +298,84 @@ Translation (for reference only):
 #     )
 
 #     return {"url": portal.url}
+
+
+from datetime import datetime, timedelta
+
+@app.post("/billing/request-restore")
+def request_restore(payload: dict = Body(...)):
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    # 🔹 IMPORTANT: use Stripe SEARCH (best we can do here)
+    customers = stripe.Customer.search(
+        query=f"email:'{email}'",
+        limit=1
+    ).data
+
+    if not customers:
+        # Do NOT leak info
+        return {"ok": True}
+
+    customer_id = customers[0].id
+
+    restore_token = secrets.token_urlsafe(32)
+    expires = datetime.utcnow() + timedelta(minutes=15)
+
+    cur.execute("""
+        INSERT INTO restore_tokens (token, customer_id, expires_at)
+        VALUES (%s, %s, %s)
+    """, (restore_token, customer_id, expires))
+
+    restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+
+    # 🔹 SEND EMAIL HERE
+    # send_email(
+    #   to=email,
+    #   subject="Restore your Lexikon subscription",
+    #   body=f"Click to restore: {restore_url}"
+    # )
+
+    print("RESTORE LINK:", restore_url)  # dev-only
+
+    return {"ok": True}
+
+@app.post("/billing/restore-from-link")
+def restore_from_link(payload: dict = Body(...)):
+    token = payload.get("restore_token")
+    if not token:
+        raise HTTPException(status_code=400)
+
+    cur.execute("""
+        SELECT customer_id
+        FROM restore_tokens
+        WHERE token = %s
+          AND expires_at > NOW()
+    """, (token,))
+
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+    customer_id = row["customer_id"]
+
+    # Ensure subscription still active
+    subs = stripe.Subscription.list(
+        customer=customer_id,
+        status="active",
+        limit=1
+    ).data
+
+    if not subs:
+        raise HTTPException(status_code=402)
+
+    pro_token = mint_pro_token(customer_id)
+
+    # One-time use
+    cur.execute("DELETE FROM restore_tokens WHERE token = %s", (token,))
+
+    return {"pro_token": pro_token}
 
 
 @app.get("/billing/portal")
