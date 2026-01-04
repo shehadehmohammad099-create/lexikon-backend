@@ -309,8 +309,37 @@ def billing_portal(request: Request):
     return {"url": portal.url}
 
 
-@app.route("/billing/restore", methods=["POST"])
-def restore_subscription():
+@app.post("/billing/restore")
+def restore_subscription(payload: dict = Body(...)):
+    email = payload.get("email")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    # 1. Find Stripe customer by email
+    customers = stripe.Customer.list(email=email, limit=1).data
+    if not customers:
+        raise HTTPException(status_code=404, detail="No customer found")
+
+    customer = customers[0]
+
+    # 2. Check active subscription
+    subs = stripe.Subscription.list(
+        customer=customer.id,
+        status="active",
+        limit=1
+    ).data
+
+    if not subs:
+        raise HTTPException(status_code=402, detail="No active subscription")
+
+    # 3. Mint a fresh Pro token
+    pro_token = mint_pro_token(customer.id)
+
+    return {
+        "pro_token": pro_token
+    }
+
     data = request.get_json(force=True)
     email = data.get("email")
 
