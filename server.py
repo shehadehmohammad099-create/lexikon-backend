@@ -3,23 +3,50 @@ import secrets
 import stripe
 import openai
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import Optional, List
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from fastapi import Body
 import requests
 from contextlib import contextmanager
-
+import json
+import stanza
+import re
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
+
+
+# Initialize Stanza pipelines (downloaded on first use)
+STANZA_PIPELINES = {}
+
+def get_stanza_pipeline(lang: str):
+    """Get or create a Stanza pipeline for the given language."""
+    lang_map = {
+        "en": "en",
+        "grc": "grc",  # Ancient Greek
+        "la": "la",    # Latin
+    }
+    
+    stanza_lang = lang_map.get(lang, "en")
+    
+    if stanza_lang not in STANZA_PIPELINES:
+        print(f"📚 Loading Stanza model for {stanza_lang}...")
+        stanza.download(stanza_lang, verbose=False)
+        STANZA_PIPELINES[stanza_lang] = stanza.Pipeline(
+            stanza_lang, 
+            processors='tokenize,pos,lemma',
+            verbose=False
+        )
+    
+    return STANZA_PIPELINES[stanza_lang]
 
 
 @contextmanager
@@ -70,6 +97,22 @@ def init_db():
           customer_id TEXT NOT NULL,
           expires_at TIMESTAMPTZ NOT NULL
         )
+        """)
+        
+        # New table for user-uploaded texts
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_texts (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          language TEXT NOT NULL,
+          sections JSONB NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+        
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS user_texts_user_idx ON user_texts (user_id)
         """)
 
 init_db()
@@ -669,3 +712,245 @@ def restore_pro(session_id: str):
         """, (token, customer_id))
 
     return {"pro_token": token}
+
+
+# -------------------------
+# USER TEXT IMPORT ENDPOINTS
+# -------------------------
+
+def get_user_id(request: Request) -> str:
+    """Get user ID from pro token, or generate anonymous ID from IP."""
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if customer_id:
+        return customer_id
+    
+    # For non-pro users, use a hash of their IP as a simple identifier
+    # This isn't perfect but allows basic text storage without auth
+    client_ip = request.client.host if request.client else "unknown"
+    return f"anon_{secrets.token_urlsafe(8)}_{hash(client_ip) % 10000}"
+
+
+def process_text_with_stanza(text: str, language: str) -> List[dict]:
+    """Process text with Stanza and return sections with tokens."""
+    
+    # Split into sections by double newline (paragraphs)
+    raw_sections = re.split(r'\n\s*\n', text.strip())
+    
+    # If no paragraphs found or very few, split by ~500 words
+    if len(raw_sections) <= 1:
+        words = text.split()
+        raw_sections = []
+        for i in range(0, len(words), 500):
+            raw_sections.append(' '.join(words[i:i+500]))
+    
+    # Limit sections to prevent huge processing times
+    raw_sections = raw_sections[:50]  # Max 50 sections
+    
+    nlp = get_stanza_pipeline(language)
+    sections = []
+    
+    for idx, section_text in enumerate(raw_sections):
+        section_text = section_text.strip()
+        if not section_text:
+            continue
+            
+        # Process with Stanza
+        doc = nlp(section_text)
+        
+        tokens = []
+        token_idx = 0
+        
+        for sentence in doc.sentences:
+            for word in sentence.words:
+                tokens.append({
+                    "id": f"w{token_idx}",
+                    "t": word.text,
+                    "lemma": word.lemma or word.text,
+                    "pos": word.upos or "",
+                    "morph": word.feats or ""
+                })
+                token_idx += 1
+        
+        sections.append({
+            "id": f"section_{idx + 1}",
+            "label": f"Section {idx + 1}",
+            "tokens": tokens,
+            "translation": ""  # User can add later if they want
+        })
+    
+    return sections
+
+
+def count_words(text: str) -> int:
+    """Count words in text."""
+    return len(text.split())
+
+
+@app.post("/texts/upload")
+async def upload_text(
+    request: Request,
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    language: str = Form(...)  # "en", "grc", "la"
+):
+    """Upload and process a text file."""
+    
+    # Get user identifier
+    user_id = get_user_id(request)
+    
+    # Read file
+    try:
+        content = await file.read()
+        text = content.decode('utf-8')
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+    
+    # Validate word count
+    word_count = count_words(text)
+    if word_count > 10000:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Text too long ({word_count} words). Maximum is 10,000 words."
+        )
+    
+    if word_count < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Text too short. Please upload at least 10 words."
+        )
+    
+    # Validate language
+    if language not in ["en", "grc", "la"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Language must be 'en' (English), 'grc' (Ancient Greek), or 'la' (Latin)"
+        )
+    
+    # Process text
+    try:
+        print(f"📝 Processing {word_count} words in {language} for user {user_id[:20]}...")
+        sections = process_text_with_stanza(text, language)
+        print(f"✅ Created {len(sections)} sections")
+    except Exception as e:
+        print(f"❌ Processing error: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+    
+    # Generate unique ID for this text
+    text_id = f"user_{secrets.token_urlsafe(12)}"
+    
+    # Save to database
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO user_texts (id, user_id, title, language, sections)
+        VALUES (%s, %s, %s, %s, %s)
+        """, (text_id, user_id, title, language, Json(sections)))
+    
+    return {
+        "id": text_id,
+        "title": title,
+        "language": language,
+        "section_count": len(sections),
+        "word_count": word_count
+    }
+
+
+@app.get("/texts")
+def list_user_texts(request: Request):
+    """List all texts uploaded by the current user."""
+    user_id = get_user_id(request)
+    
+    # For anonymous users, they won't have persistent access
+    # Only pro token users get reliable text listing
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    
+    if not customer_id:
+        return {"texts": [], "message": "Sign in to save and access your texts"}
+    
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, title, language, created_at,
+               jsonb_array_length(sections) as section_count
+        FROM user_texts
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        """, (customer_id,))
+        
+        rows = cur.fetchall()
+        
+        texts = []
+        for r in rows:
+            texts.append({
+                "id": r["id"],
+                "title": r["title"],
+                "language": r["language"],
+                "section_count": r["section_count"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            })
+        
+        return {"texts": texts}
+
+
+@app.get("/texts/{text_id}")
+def get_user_text(text_id: str, request: Request):
+    """Get a specific user text with all sections."""
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, user_id, title, language, sections
+        FROM user_texts
+        WHERE id = %s
+        """, (text_id,))
+        
+        row = cur.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Text not found")
+        
+        # Check ownership (only owner can access)
+        if customer_id and row["user_id"] != customer_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "language": row["language"],
+            "sections": row["sections"]
+        }
+
+
+@app.delete("/texts/{text_id}")
+def delete_user_text(text_id: str, request: Request):
+    """Delete a user text."""
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    with get_db() as cur:
+        # Check ownership first
+        cur.execute("""
+        SELECT user_id FROM user_texts WHERE id = %s
+        """, (text_id,))
+        
+        row = cur.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Text not found")
+        
+        if row["user_id"] != customer_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Delete
+        cur.execute("DELETE FROM user_texts WHERE id = %s", (text_id,))
+        
+        # Also delete any annotations for this text
+        cur.execute("""
+        DELETE FROM annotations WHERE work_id = %s AND customer_id = %s
+        """, (text_id, customer_id))
+    
+    return {"ok": True}
