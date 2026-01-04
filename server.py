@@ -2,6 +2,7 @@ import os
 import secrets
 import stripe
 import openai
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -205,104 +206,50 @@ def send_restore_email(to_email: str, restore_url: str):
 
 @app.get("/checkout-success")
 def checkout_success(session_id: str, request: Request):
-    session = stripe.checkout.Session.retrieve(
-        session_id,
-        expand=["customer"]
-    )
-
-    customer_id = session.customer.id
-
-    email = (
-        session.customer_details.email
-        if session.customer_details and session.customer_details.email
-        else None
-    )
-
-
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="Missing customer")
-
-    # Issue Pro token
-    pro_token = secrets.token_urlsafe(32)
-    cur.execute(
-        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
-        (pro_token, customer_id)
-    )
-
-    # Restore token
-    restore_token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(days=7)
-
-    cur.execute("""
-        INSERT INTO restore_tokens (token, customer_id, expires_at)
-        VALUES (%s, %s, %s)
-    """, (restore_token, customer_id, expires_at))
-
-    # 🔑 THIS IS THE IMPORTANT PART
-    origin = request.headers.get("origin") or FRONTEND_URL
-
-    restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
-
-    print("RESTORE LINK:", restore_url)
-
-    return {"pro_token": pro_token}
-
-    print("CHECKOUT EMAIL:", email)
-
-    restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
-
-    if email:
-        send_restore_email(email, restore_url)
-
-
-
-    session = stripe.checkout.Session.retrieve(
-        session_id,
-        expand=["customer"]
-    )
-
-    customer_id = session.customer.id
-    email = session.customer.email  # THIS is reliable here
-
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="Missing customer")
-
-    # Issue Pro token (existing behavior)
-    pro_token = secrets.token_urlsafe(32)
-    cur.execute(
-        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
-        (pro_token, customer_id)
-    )
-
-    # 🔐 CREATE RESTORE TOKEN HERE (key change)
-    restore_token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(days=7)
-
-    cur.execute("""
-        INSERT INTO restore_tokens (token, customer_id, expires_at)
-        VALUES (%s, %s, %s)
-    """, (restore_token, customer_id, expires_at))
-
-    restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
-
-    print("RESTORE LINK (SAVE THIS):", restore_url)
-
-    return {"pro_token": pro_token}
     try:
-        session = stripe.checkout.Session.retrieve(session_id)
+        session = stripe.checkout.Session.retrieve(
+            session_id,
+            expand=["customer"]
+        )
 
-        customer_id = session.customer
+        customer_id = session.customer.id
+
+        email = (
+            session.customer_details.email
+            if session.customer_details and session.customer_details.email
+            else None
+        )
+
         if not customer_id:
             raise HTTPException(status_code=400, detail="Missing customer")
 
-        token = secrets.token_urlsafe(32)
-
+        # Issue Pro token
+        pro_token = secrets.token_urlsafe(32)
         cur.execute(
             "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
-            (token, customer_id)
+            (pro_token, customer_id)
         )
 
-        return {"pro_token": token}
+        # Restore token
+        restore_token = secrets.token_urlsafe(32)
+        expires_at = datetime.utcnow() + timedelta(days=7)
+
+        cur.execute("""
+            INSERT INTO restore_tokens (token, customer_id, expires_at)
+            VALUES (%s, %s, %s)
+        """, (restore_token, customer_id, expires_at))
+
+        origin = request.headers.get("origin") or FRONTEND_URL
+        restore_url = f"{origin}/frontend/static/app.html?restore_token={restore_token}"
+
+        print("RESTORE LINK:", restore_url)
+        print("CHECKOUT EMAIL:", email)
+
+        # Send restore email if we have an email
+        if email:
+            send_restore_email(email, restore_url)
+
+        return {"pro_token": pro_token}
 
     except HTTPException as e:
         raise e
@@ -450,79 +397,6 @@ Translation (for reference only):
 #     return {"url": portal.url}
 
 
-from datetime import datetime, timedelta
-# @app.post("/billing/request-restore")
-# async def request_restore(request: Request):
-    # print("HIT")
-    # payload = await request.json()
-    # email = payload.get("email")
-
-    # if not email:
-    #     # Always succeed to avoid email enumeration
-    #     return {"ok": True}
-
-    # customers = stripe.Customer.search(
-    #     query=f"email:'{email}'",
-    #     limit=1
-    # ).data
-
-    # if not customers:
-    #     return {"ok": True}
-
-    # customer_id = customers[0].id
-    # print("CUSTOMERS FOUND:", len(customers))
-    # restore_token = secrets.token_urlsafe(32)
-    # expires_at = datetime.utcnow() + timedelta(minutes=15)
-
-    # cur.execute("""
-    #     INSERT INTO restore_tokens (token, customer_id, expires_at)
-    #     VALUES (%s, %s, %s)
-    # """, (restore_token, customer_id, expires_at))
-
-    # restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
-
-    # # DEV MODE: log instead of email
-    # print("RESTORE LINK:", restore_url)
-
-    # return {"ok": True}
-
-    # email = payload.get("email")
-    # if not email:
-    #     raise HTTPException(status_code=400, detail="Email required")
-
-    # # 🔹 IMPORTANT: use Stripe SEARCH (best we can do here)
-    # customers = stripe.Customer.search(
-    #     query=f"email:'{email}'",
-    #     limit=1
-    # ).data
-
-    # if not customers:
-    #     # Do NOT leak info
-    #     return {"ok": True}
-
-    # customer_id = customers[0].id
-
-    # restore_token = secrets.token_urlsafe(32)
-    # expires = datetime.utcnow() + timedelta(minutes=15)
-
-    # cur.execute("""
-    #     INSERT INTO restore_tokens (token, customer_id, expires_at)
-    #     VALUES (%s, %s, %s)
-    # """, (restore_token, customer_id, expires))
-
-    # restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
-
-    # # 🔹 SEND EMAIL HERE
-    # # send_email(
-    # #   to=email,
-    # #   subject="Restore your Lexikon subscription",
-    # #   body=f"Click to restore: {restore_url}"
-    # # )
-
-    # print("RESTORE LINK:", restore_url)  # dev-only
-
-    # return {"ok": True}
-
 @app.post("/billing/restore-from-link")
 async def restore_from_link(request: Request):
     payload = await request.json()
@@ -565,40 +439,6 @@ async def restore_from_link(request: Request):
 
     return {"pro_token": pro_token}
 
-    token = payload.get("restore_token")
-    if not token:
-        raise HTTPException(status_code=400)
-
-    cur.execute("""
-        SELECT customer_id
-        FROM restore_tokens
-        WHERE token = %s
-          AND expires_at > NOW()
-    """, (token,))
-
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=400, detail="Invalid or expired link")
-
-    customer_id = row["customer_id"]
-
-    # Ensure subscription still active
-    subs = stripe.Subscription.list(
-        customer=customer_id,
-        status="active",
-        limit=1
-    ).data
-
-    if not subs:
-        raise HTTPException(status_code=402)
-
-    pro_token = mint_pro_token(customer_id)
-
-    # One-time use
-    cur.execute("DELETE FROM restore_tokens WHERE token = %s", (token,))
-
-    return {"pro_token": pro_token}
-
 
 @app.get("/billing/portal")
 def billing_portal(request: Request):
@@ -615,43 +455,6 @@ def billing_portal(request: Request):
     )
 
     return {"url": portal.url}
-
-
-
-    email = payload.get("email")
-
-    if not email:
-        raise HTTPException(status_code=400, detail="Email required")
-
-    # 1. Find Stripe customer by email
-    customers = stripe.Customer.search(
-        query=f"email:'{email}'",
-        limit=1
-    ).data
-
-    if not customers:
-        raise HTTPException(status_code=404, detail="No customer found")
-
-    customer = customers[0]
-
-    # 2. Check active subscription
-    subs = stripe.Subscription.list(
-        customer=customer.id,
-        status="active",
-        limit=1
-    ).data
-
-    if not subs:
-        raise HTTPException(status_code=402, detail="No active subscription")
-
-    # 3. Mint a fresh Pro token
-    pro_token = mint_pro_token(customer.id)
-
-    return {
-        "pro_token": pro_token
-    }
-
-
 
 
 @app.get("/billing/restore-token")
@@ -692,24 +495,6 @@ def save_annotation(req: SaveAnnotation, request: Request):
     if not customer_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Upsert by unique index
-    cur.execute("""
-    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content, visibility)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT (customer_id, work_id, section_id, token_id)
-    DO UPDATE SET content = EXCLUDED.content, visibility = EXCLUDED.visibility, updated_at = NOW()
-    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, req.visibility))
-
-    return {"ok": True}
-
-
-@app.post("/annotations")
-def save_annotation(req: SaveAnnotation, request: Request):
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
-    if not customer_id:
-        raise HTTPException(status_code=401)
-
     # DELETE if empty
     if not req.content.strip():
         cur.execute("""
@@ -728,19 +513,14 @@ def save_annotation(req: SaveAnnotation, request: Request):
 
     # Otherwise UPSERT
     cur.execute("""
-    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content)
-    VALUES (%s, %s, %s, %s, %s)
+    INSERT INTO annotations (customer_id, work_id, section_id, token_id, content, visibility)
+    VALUES (%s, %s, %s, %s, %s, %s)
     ON CONFLICT (customer_id, work_id, section_id, token_id)
-    DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
-    """, (
-        customer_id,
-        req.work_id,
-        req.section_id,
-        req.token_id,
-        req.content
-    ))
+    DO UPDATE SET content = EXCLUDED.content, visibility = EXCLUDED.visibility, updated_at = NOW()
+    """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, req.visibility))
 
     return {"ok": True}
+
 
 @app.get("/annotations")
 def get_annotations(work_id: str, section_id: str, request: Request):
