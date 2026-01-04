@@ -134,7 +134,7 @@ def create_checkout_session(request: Request):
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         billing_address_collection="required",
-        success_url=f"{origin}/static/app.html?session_id={{CHECKOUT_SESSION_ID}}",
+        success_url=f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{origin}/index.html",
     )
 
@@ -464,7 +464,7 @@ def billing_portal(request: Request):
 
     portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}//static/app.html"
+        return_url=f"{origin}//app.html"
     )
 
     return {"url": portal.url}
