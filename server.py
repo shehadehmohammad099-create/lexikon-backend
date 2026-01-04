@@ -139,30 +139,30 @@ def create_checkout_session(request: Request):
     return {"url": session.url}
 
 def send_restore_email(to_email: str, restore_url: str):
-requests.post(
-    "https://api.resend.com/emails",
-    headers={
-        "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
-        "Content-Type": "application/json",
-    },
-    json={
-        "from": "Lexikon <restore@lexikon.app>",
-        "to": to_email,
-        "subject": "Restore your Lexikon subscription",
-        "html": f"""
-            <p>You can restore your Lexikon Pro access by clicking the link below:</p>
+    requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": "Lexikon <restore@lexikon.app>",
+            "to": to_email,
+            "subject": "Restore your Lexikon subscription",
+            "html": f"""
+                <p>You can restore your Lexikon Pro access by clicking the link below:</p>
 
-            <p>
-            <a href="{restore_url}">
-                Restore my subscription
-            </a>
-            </p>
+                <p>
+                <a href="{restore_url}">
+                    Restore my subscription
+                </a>
+                </p>
 
-            <p>This link can be used once and will expire.</p>
-        """
-    },
-    timeout=5,
-)
+                <p>This link can be used once and will expire.</p>
+            """
+        },
+        timeout=5,
+    )
 
 
 @app.get("/checkout-success")
