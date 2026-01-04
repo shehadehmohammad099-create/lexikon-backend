@@ -138,6 +138,38 @@ def create_checkout_session(request: Request):
 
 @app.get("/checkout-success")
 def checkout_success(session_id: str):
+    session = stripe.checkout.Session.retrieve(
+        session_id,
+        expand=["customer"]
+    )
+
+    customer_id = session.customer.id
+    email = session.customer.email  # THIS is reliable here
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customer")
+
+    # Issue Pro token (existing behavior)
+    pro_token = secrets.token_urlsafe(32)
+    cur.execute(
+        "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+        (pro_token, customer_id)
+    )
+
+    # 🔐 CREATE RESTORE TOKEN HERE (key change)
+    restore_token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=7)
+
+    cur.execute("""
+        INSERT INTO restore_tokens (token, customer_id, expires_at)
+        VALUES (%s, %s, %s)
+    """, (restore_token, customer_id, expires_at))
+
+    restore_url = f"{FRONTEND_URL}?restore_token={restore_token}"
+
+    print("RESTORE LINK (SAVE THIS):", restore_url)
+
+    return {"pro_token": pro_token}
     try:
         session = stripe.checkout.Session.retrieve(session_id)
 
@@ -301,8 +333,8 @@ Translation (for reference only):
 
 
 from datetime import datetime, timedelta
-@app.post("/billing/request-restore")
-async def request_restore(request: Request):
+# @app.post("/billing/request-restore")
+# async def request_restore(request: Request):
     print("HIT")
     payload = await request.json()
     email = payload.get("email")
