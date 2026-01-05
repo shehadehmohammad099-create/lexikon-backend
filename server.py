@@ -3,6 +3,7 @@ import secrets
 import stripe
 import openai
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -193,6 +194,21 @@ def has_pro(pro_token: str | None) -> bool:
     return len(subs.data) > 0
 
 
+def get_frontend_origin(request: Request) -> str:
+    """Best-effort origin for links (use request origin, then referer, else default)."""
+    origin = request.headers.get("origin")
+    if origin:
+        return origin
+
+    referer = request.headers.get("referer")
+    if referer:
+        parsed = urlparse(referer)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+
+    return FRONTEND_URL
+
+
 # -------------------------
 # MODELS
 # -------------------------
@@ -318,6 +334,7 @@ async def stripe_webhook(request: Request):
         session = event["data"]["object"]
         customer_id = session["customer"]
         email = session["customer_details"]["email"]
+        origin = get_frontend_origin(request)
 
         restore_token = secrets.token_urlsafe(32)
         expires_at = datetime.utcnow() + timedelta(days=7)
@@ -328,7 +345,7 @@ async def stripe_webhook(request: Request):
                 VALUES (%s, %s, %s)
             """, (restore_token, customer_id, expires_at))
 
-        restore_url = f"{FRONTEND_URL}/static/app.html?restore_token={restore_token}"
+        restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
         send_restore_email(email, restore_url)
 
     return {"ok": True}
@@ -366,7 +383,7 @@ def checkout_success(session_id: str, request: Request):
                 VALUES (%s, %s, %s)
             """, (restore_token, customer_id, expires_at))
 
-        origin = request.headers.get("origin") or FRONTEND_URL
+        origin = get_frontend_origin(request)
         restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
 
         print("RESTORE LINK:", restore_url)
@@ -429,7 +446,8 @@ async def request_restore(request: Request):
             VALUES (%s, %s, %s)
         """, (restore_token, customer.id, expires_at))
 
-    restore_url = f"{FRONTEND_URL}/static/app.html?restore_token={restore_token}"
+    origin = get_frontend_origin(request)
+    restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
 
     print(f"📧 Sending restore email to {email}...")
     send_restore_email(email, restore_url)
