@@ -115,6 +115,23 @@ def init_db():
         CREATE INDEX IF NOT EXISTS user_texts_user_idx ON user_texts (user_id)
         """)
 
+        # Flashcard sets (cloud sync for Pro)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS flashcard_sets (
+          user_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          cards JSONB NOT NULL DEFAULT '[]',
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (user_id, id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS flashcard_sets_user_idx ON flashcard_sets (user_id)
+        """)
+
 init_db()
 
 
@@ -203,6 +220,31 @@ class SaveAnnotation(BaseModel):
     token_id: Optional[str] = None
     content: str
     visibility: Optional[str] = "private"
+
+
+class Flashcard(BaseModel):
+    id: str
+    work_id: Optional[str] = None
+    section_id: Optional[str] = None
+    token_id: Optional[str] = None
+    text: Optional[str] = ""
+    lemma: Optional[str] = ""
+    gloss: Optional[str] = ""
+    morph: Optional[str] = ""
+    context: Optional[str] = ""
+    translation: Optional[str] = ""
+    created_at: Optional[str] = ""
+
+
+class FlashcardSet(BaseModel):
+    id: str
+    name: str
+    cards: List[Flashcard] = []
+    updated_at: Optional[str] = None
+
+
+class FlashcardSyncRequest(BaseModel):
+    sets: List[FlashcardSet] = []
 
 
 # -------------------------
@@ -490,13 +532,18 @@ def explain_word(req: ExplainWord, request: Request):
             raise HTTPException(status_code=402, detail="Pro required")
 
         prompt = f"""
-Explain this word philologically.
-It is either in Latin or Greek.
+You are a classical languages tutor. Give a concise, pointed coaching note (not an info dump).
+Goal: help a student see the key grammatical cue and how it fits the sentence; then suggest a quick follow-up question.
+Be brief (4-6 sentences max).
+Include:
+- What the form tells us (lemma, POS, morphology).
+- One or two likely syntactic roles.
+- One micro-question to check understanding.
 Word: {req.token}
 Lemma: {req.lemma}
 POS: {req.pos}
 Morphology: {req.morph}
-Context: {req.sentence}
+Context word/phrase: {req.sentence}
 """
 
         r = openai.ChatCompletion.create(
@@ -529,10 +576,12 @@ def explain_passage(req: ExplainPassage, request: Request):
             raise HTTPException(status_code=402, detail="Pro required")
 
         prompt = f"""
-Explain this passage philologically.
-Do NOT summarize or paraphrase.
-Focus on syntax, structure, and argumentative flow.
-Explain why the Greek may be difficult to read.
+You are a classical languages tutor. Give a short, structured walkthrough to help a student read the passage (not a summary).
+Keep it to 5-8 sentences. Focus on:
+- Sentence spine: finite verbs and clauses (who does what).
+- Two or three tricky constructions or particles to watch.
+- One quick check-for-understanding question at the end.
+Avoid paraphrase; stay on syntax and how to navigate it.
 
 Work: {req.work}
 Section: {req.section}
@@ -732,6 +781,20 @@ def get_user_id(request: Request) -> str | None:
         return anon_id
     
     return None
+
+
+def require_pro_user(request: Request, allow_inactive: bool = False) -> str:
+    """Return customer id from pro token. Optionally skip active sub check."""
+    token = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(token)
+
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Pro token required")
+
+    if not allow_inactive and not has_pro(token):
+        raise HTTPException(status_code=402, detail="Pro subscription required")
+
+    return customer_id
 
 
 def process_text_with_stanza(text: str, language: str) -> List[dict]:
@@ -989,4 +1052,112 @@ def delete_user_text(text_id: str, request: Request):
         DELETE FROM annotations WHERE work_id = %s AND customer_id = %s
         """, (text_id, user_id))
     
+    return {"ok": True}
+
+
+# -------------------------
+# FLASHCARD ENDPOINTS
+# -------------------------
+
+@app.get("/flashcards")
+def list_flashcards(request: Request):
+    """Return all flashcard sets for the current Pro user."""
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+
+    if not customer_id:
+        return {"sets": []}
+
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, name, cards, updated_at
+        FROM flashcard_sets
+        WHERE user_id = %s
+        ORDER BY updated_at DESC
+        """, (customer_id,))
+
+        rows = cur.fetchall() or []
+        return {"sets": rows}
+
+
+@app.post("/flashcards")
+def save_flashcard_set(req: FlashcardSet, request: Request):
+    """Upsert a single flashcard set for the user."""
+    customer_id = require_pro_user(request)
+    updated_at = req.updated_at or datetime.utcnow().isoformat()
+
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO flashcard_sets (user_id, id, name, cards, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, id)
+        DO UPDATE SET
+          name = EXCLUDED.name,
+          cards = EXCLUDED.cards,
+          updated_at = EXCLUDED.updated_at
+        """, (
+            customer_id,
+            req.id,
+            req.name,
+            Json([c.dict() if hasattr(c, "dict") else c for c in (req.cards or [])]),
+            updated_at
+        ))
+
+    return {"ok": True}
+
+
+@app.post("/flashcards/sync")
+def sync_flashcards(req: FlashcardSyncRequest, request: Request):
+    """Replace all flashcard sets for the user (used for migration/sync)."""
+    customer_id = require_pro_user(request)
+
+    with get_db() as cur:
+        cur.execute("DELETE FROM flashcard_sets WHERE user_id = %s", (customer_id,))
+
+        for s in req.sets:
+            updated_at = s.updated_at or datetime.utcnow().isoformat()
+            cur.execute("""
+            INSERT INTO flashcard_sets (user_id, id, name, cards, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, id)
+            DO UPDATE SET
+              name = EXCLUDED.name,
+              cards = EXCLUDED.cards,
+              updated_at = EXCLUDED.updated_at
+            """, (
+                customer_id,
+                s.id,
+                s.name,
+                Json([c.dict() if hasattr(c, "dict") else c for c in (s.cards or [])]),
+                updated_at
+            ))
+
+    return {"ok": True}
+
+
+@app.delete("/flashcards/{set_id}")
+def delete_flashcard_set(set_id: str, request: Request):
+    """Delete a single set. allow_inactive=True so users can clean up after downgrading."""
+    customer_id = require_pro_user(request, allow_inactive=True)
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM flashcard_sets
+        WHERE user_id = %s AND id = %s
+        """, (customer_id, set_id))
+
+    return {"ok": True}
+
+
+@app.delete("/flashcards")
+def delete_all_flashcards(request: Request):
+    """Delete all flashcard sets for a user (used when moving off Pro)."""
+    customer_id = require_pro_user(request, allow_inactive=True)
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM flashcard_sets
+        WHERE user_id = %s
+        """, (customer_id,))
+
     return {"ok": True}
