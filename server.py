@@ -194,19 +194,32 @@ def has_pro(pro_token: str | None) -> bool:
     return len(subs.data) > 0
 
 
+    return FRONTEND_URL
+
+
+def clean_origin(origin: str) -> str:
+    """Strip trailing slash and /static suffix from origin."""
+    if not origin:
+        return ""
+    origin = origin.rstrip("/")
+    if origin.endswith("/static"):
+        origin = origin[:-7]
+    return origin.rstrip("/")
+
+
 def get_frontend_origin(request: Request) -> str:
     """Best-effort origin for links (use request origin, then referer, else default)."""
     origin = request.headers.get("origin")
     if origin:
-        return origin
+        return clean_origin(origin)
 
     referer = request.headers.get("referer")
     if referer:
         parsed = urlparse(referer)
         if parsed.scheme and parsed.netloc:
-            return f"{parsed.scheme}://{parsed.netloc}"
+            return clean_origin(f"{parsed.scheme}://{parsed.netloc}")
 
-    return FRONTEND_URL
+    return clean_origin(FRONTEND_URL)
 
 
 # -------------------------
@@ -309,7 +322,7 @@ def create_checkout_session(request: Request):
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         billing_address_collection="required",
-        success_url=f"{origin}/static/app.html?session_id={{CHECKOUT_SESSION_ID}}",
+        success_url=f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{origin}/index.html",
     )
 
@@ -345,7 +358,7 @@ async def stripe_webhook(request: Request):
                 VALUES (%s, %s, %s)
             """, (restore_token, customer_id, expires_at))
 
-        restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
+        restore_url = f"{origin}/app.html?restore_token={restore_token}"
         send_restore_email(email, restore_url)
 
     return {"ok": True}
@@ -384,7 +397,7 @@ def checkout_success(session_id: str, request: Request):
             """, (restore_token, customer_id, expires_at))
 
         origin = get_frontend_origin(request)
-        restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
+        restore_url = f"{origin}/app.html?restore_token={restore_token}"
 
         print("RESTORE LINK:", restore_url)
         print("CHECKOUT EMAIL:", email)
@@ -447,7 +460,7 @@ async def request_restore(request: Request):
         """, (restore_token, customer.id, expires_at))
 
     origin = get_frontend_origin(request)
-    restore_url = f"{origin}/static/app.html?restore_token={restore_token}"
+    restore_url = f"{origin}/app.html?restore_token={restore_token}"
 
     print(f"📧 Sending restore email to {email}...")
     send_restore_email(email, restore_url)
@@ -509,7 +522,7 @@ def billing_portal(request: Request):
 
     portal = stripe.billing_portal.Session.create(
         customer=customer_id,
-        return_url=f"{origin}/static/app.html"
+        return_url=f"{origin}/app.html"
     )
 
     return {"url": portal.url}
