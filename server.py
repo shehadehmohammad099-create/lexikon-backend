@@ -82,9 +82,15 @@ def init_db():
           section_id TEXT NOT NULL,
           token_id TEXT,
           content TEXT NOT NULL,
+          visibility TEXT NOT NULL DEFAULT 'private',
           created_at TIMESTAMPTZ DEFAULT NOW(),
           updated_at TIMESTAMPTZ DEFAULT NOW()
         )
+        """)
+
+        cur.execute("""
+        ALTER TABLE annotations
+        ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'private'
         """)
 
         cur.execute("""
@@ -131,6 +137,22 @@ def init_db():
 
         cur.execute("""
         CREATE INDEX IF NOT EXISTS flashcard_sets_user_idx ON flashcard_sets (user_id)
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS podcasts (
+          customer_id TEXT NOT NULL,
+          work_id TEXT NOT NULL,
+          work_title TEXT NOT NULL,
+          script TEXT NOT NULL,
+          audio BYTEA NOT NULL,
+          audio_mime TEXT NOT NULL DEFAULT 'audio/mpeg',
+          voice TEXT NOT NULL DEFAULT 'alloy',
+          model TEXT NOT NULL DEFAULT 'tts-1',
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (customer_id, work_id)
+        )
         """)
 
 init_db()
@@ -223,6 +245,83 @@ def get_frontend_origin(request: Request) -> str:
 
 
 # -------------------------
+# PODCAST HELPERS
+# -------------------------
+
+MAX_PODCAST_SOURCE_CHARS = 30000
+
+
+def build_podcast_source_text(sections: List[dict]) -> str:
+    """Build a capped source text from section payloads."""
+    total = 0
+    parts = []
+    for sec in sections or []:
+        label = sec.get("label") or sec.get("id") or ""
+        text = sec.get("text") or ""
+        if not text:
+            continue
+        block = f"[{label}]\n{text}\n\n"
+        if total + len(block) > MAX_PODCAST_SOURCE_CHARS:
+            remaining = MAX_PODCAST_SOURCE_CHARS - total
+            if remaining > 0:
+                parts.append(block[:remaining])
+            break
+        parts.append(block)
+        total += len(block)
+    return "".join(parts).strip()
+
+
+def generate_podcast_script(req: PodcastGenerateRequest, source_text: str) -> str:
+    """Generate a podcast script from source text using OpenAI."""
+    prompt = f"""
+You are creating a polished, listenable podcast episode for students of classical texts.
+Write a single continuous script (no bullet points) with an inviting intro, a clear arc,
+and a short outro. Aim for ~{req.target_minutes} minutes (roughly 1200-1600 words).
+Focus on: context, key themes, character arcs, and 2–3 close-reading moments.
+Avoid quoting long passages; keep quotes very short.
+If the source is partial, be transparent and avoid over-claiming.
+
+Work: {req.title}
+Author: {req.author}
+Meta: {req.meta}
+
+Source excerpt:
+{source_text}
+"""
+
+    r = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a classical philologist and podcast writer."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.4,
+        max_tokens=1800,
+    )
+
+    return r.choices[0].message.content.strip()
+
+
+def generate_podcast_audio(script: str, voice: str = "alloy", model: str = "tts-1"):
+    """Generate TTS audio bytes for a script."""
+    url = "https://api.openai.com/v1/audio/speech"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "voice": voice,
+        "input": script,
+        "response_format": "mp3"
+    }
+    res = requests.post(url, headers=headers, json=payload, timeout=60)
+    if not res.ok:
+        raise HTTPException(status_code=500, detail=f"TTS failed: {res.text}")
+    return res.content, "audio/mpeg", voice, model
+
+
+# -------------------------
 # MODELS
 # -------------------------
 class ExplainWord(BaseModel):
@@ -274,6 +373,15 @@ class FlashcardSet(BaseModel):
 
 class FlashcardSyncRequest(BaseModel):
     sets: List[FlashcardSet] = []
+
+
+class PodcastGenerateRequest(BaseModel):
+    work_id: str
+    title: str
+    author: Optional[str] = ""
+    meta: Optional[str] = ""
+    sections: List[dict] = []
+    target_minutes: Optional[int] = 10
 
 
 # -------------------------
@@ -645,6 +753,95 @@ Translation (for reference only):
             status_code=500,
             content={"error": str(e)}
         )
+
+
+# -------------------------
+# PODCAST ENDPOINTS
+# -------------------------
+
+@app.get("/podcasts/{work_id}")
+def get_podcast_meta(work_id: str, request: Request):
+    customer_id = require_pro_user(request)
+    with get_db() as cur:
+        cur.execute("""
+        SELECT work_id, created_at, updated_at, audio_mime
+        FROM podcasts
+        WHERE customer_id = %s AND work_id = %s
+        """, (customer_id, work_id))
+        row = cur.fetchone()
+
+    if not row:
+        return {"exists": False}
+
+    base_url = str(request.base_url).rstrip("/")
+    audio_url = f"{base_url}/podcasts/{work_id}/audio"
+    return {
+        "exists": True,
+        "work_id": work_id,
+        "audio_url": audio_url,
+        "audio_mime": row.get("audio_mime"),
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None
+    }
+
+
+@app.get("/podcasts/{work_id}/audio")
+def get_podcast_audio(work_id: str, request: Request):
+    customer_id = require_pro_user(request)
+    with get_db() as cur:
+        cur.execute("""
+        SELECT audio, audio_mime
+        FROM podcasts
+        WHERE customer_id = %s AND work_id = %s
+        """, (customer_id, work_id))
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Podcast not found")
+
+    return Response(
+        content=row["audio"],
+        media_type=row.get("audio_mime") or "audio/mpeg",
+        headers={"Cache-Control": "private, max-age=3600"}
+    )
+
+
+@app.post("/podcasts/generate")
+def generate_podcast(req: PodcastGenerateRequest, request: Request):
+    customer_id = require_pro_user(request)
+
+    if not req.sections:
+        raise HTTPException(status_code=400, detail="No sections provided")
+
+    source_text = build_podcast_source_text(req.sections)
+    if not source_text:
+        raise HTTPException(status_code=400, detail="No source text available")
+
+    script = generate_podcast_script(req, source_text)
+    audio_bytes, audio_mime, voice, model = generate_podcast_audio(script)
+
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO podcasts (customer_id, work_id, work_title, script, audio, audio_mime, voice, model)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (customer_id, work_id) DO UPDATE SET
+          work_title = EXCLUDED.work_title,
+          script = EXCLUDED.script,
+          audio = EXCLUDED.audio,
+          audio_mime = EXCLUDED.audio_mime,
+          voice = EXCLUDED.voice,
+          model = EXCLUDED.model,
+          updated_at = NOW()
+        """, (customer_id, req.work_id, req.title, script, psycopg2.Binary(audio_bytes), audio_mime, voice, model))
+
+    base_url = str(request.base_url).rstrip("/")
+    audio_url = f"{base_url}/podcasts/{req.work_id}/audio"
+    return {
+        "ok": True,
+        "work_id": req.work_id,
+        "audio_url": audio_url,
+        "updated_at": datetime.utcnow().isoformat()
+    }
 
 
 # -------------------------
