@@ -808,40 +808,59 @@ def get_podcast_audio(work_id: str, request: Request):
 
 @app.post("/podcasts/generate")
 def generate_podcast(req: PodcastGenerateRequest, request: Request):
-    customer_id = require_pro_user(request)
+    try:
+        print("🎙️ Podcast generate: start")
+        customer_id = require_pro_user(request)
+        print(f"🎙️ customer_id={customer_id} work_id={req.work_id}")
 
-    if not req.sections:
-        raise HTTPException(status_code=400, detail="No sections provided")
+        if not req.sections:
+            print("⚠️ No sections provided")
+            raise HTTPException(status_code=400, detail="No sections provided")
 
-    source_text = build_podcast_source_text(req.sections)
-    if not source_text:
-        raise HTTPException(status_code=400, detail="No source text available")
+        source_text = build_podcast_source_text(req.sections)
+        print(f"🎙️ source chars={len(source_text)} sections={len(req.sections)}")
+        if not source_text:
+            print("⚠️ No source text available")
+            raise HTTPException(status_code=400, detail="No source text available")
 
-    script = generate_podcast_script(req, source_text)
-    audio_bytes, audio_mime, voice, model = generate_podcast_audio(script)
+        print("🎙️ generating script…")
+        script = generate_podcast_script(req, source_text)
+        print(f"🎙️ script length={len(script)}")
 
-    with get_db() as cur:
-        cur.execute("""
-        INSERT INTO podcasts (customer_id, work_id, work_title, script, audio, audio_mime, voice, model)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (customer_id, work_id) DO UPDATE SET
-          work_title = EXCLUDED.work_title,
-          script = EXCLUDED.script,
-          audio = EXCLUDED.audio,
-          audio_mime = EXCLUDED.audio_mime,
-          voice = EXCLUDED.voice,
-          model = EXCLUDED.model,
-          updated_at = NOW()
-        """, (customer_id, req.work_id, req.title, script, psycopg2.Binary(audio_bytes), audio_mime, voice, model))
+        print("🎙️ generating audio…")
+        audio_bytes, audio_mime, voice, model = generate_podcast_audio(script)
+        print(f"🎙️ audio bytes={len(audio_bytes)} mime={audio_mime} voice={voice} model={model}")
 
-    base_url = str(request.base_url).rstrip("/")
-    audio_url = f"{base_url}/podcasts/{req.work_id}/audio"
-    return {
-        "ok": True,
-        "work_id": req.work_id,
-        "audio_url": audio_url,
-        "updated_at": datetime.utcnow().isoformat()
-    }
+        with get_db() as cur:
+            print("🎙️ writing to DB…")
+            cur.execute("""
+            INSERT INTO podcasts (customer_id, work_id, work_title, script, audio, audio_mime, voice, model)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (customer_id, work_id) DO UPDATE SET
+              work_title = EXCLUDED.work_title,
+              script = EXCLUDED.script,
+              audio = EXCLUDED.audio,
+              audio_mime = EXCLUDED.audio_mime,
+              voice = EXCLUDED.voice,
+              model = EXCLUDED.model,
+              updated_at = NOW()
+            """, (customer_id, req.work_id, req.title, script, psycopg2.Binary(audio_bytes), audio_mime, voice, model))
+
+        base_url = str(request.base_url).rstrip("/")
+        audio_url = f"{base_url}/podcasts/{req.work_id}/audio"
+        print(f"🎙️ done audio_url={audio_url}")
+        return {
+            "ok": True,
+            "work_id": req.work_id,
+            "audio_url": audio_url,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+    except HTTPException as e:
+        print(f"❌ Podcast generate HTTP error: {e.detail}")
+        raise e
+    except Exception as e:
+        print(f"❌ Podcast generate error: {e}")
+        raise e
 
 
 # -------------------------
