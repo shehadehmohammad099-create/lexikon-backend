@@ -833,7 +833,13 @@ def get_podcast_meta(work_id: str, request: Request):
 
 @app.get("/podcasts/{work_id}/audio")
 def get_podcast_audio(work_id: str, request: Request):
-    customer_id = require_pro_user(request)
+    # Audio tag can't send headers, so allow token via query param
+    token = request.headers.get("X-Pro-Token") or request.query_params.get("token")
+    customer_id = customer_from_token(token)
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Pro token required")
+    if not has_pro(token):
+        raise HTTPException(status_code=402, detail="Pro subscription required")
     with get_db() as cur:
         cur.execute("""
         SELECT audio, audio_mime
@@ -845,10 +851,19 @@ def get_podcast_audio(work_id: str, request: Request):
     if not row:
         raise HTTPException(status_code=404, detail="Podcast not found")
 
+    audio_data = row["audio"]
+    if isinstance(audio_data, memoryview):
+        audio_data = audio_data.tobytes()
+    size = len(audio_data) if audio_data else 0
+    print(f"🎧 audio bytes={size} work_id={work_id} customer_id={customer_id}")
+
     return Response(
-        content=row["audio"],
+        content=audio_data,
         media_type=row.get("audio_mime") or "audio/mpeg",
-        headers={"Cache-Control": "private, max-age=3600"}
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "Content-Length": str(size)
+        }
     )
 
 
