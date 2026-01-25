@@ -365,23 +365,69 @@ Source excerpt:
     return r.choices[0].message.content.strip()
 
 
+def split_text_for_tts(text: str, max_chars: int = 3800) -> List[str]:
+    """Split text into chunks within TTS limits, preferring paragraph boundaries."""
+    if not text:
+        return []
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    chunks = []
+    current = ""
+    for para in paragraphs:
+        if len(para) > max_chars:
+            # Fallback to sentence-ish splits for very long paragraphs
+            sentences = re.split(r'(?<=[.!?])\s+', para)
+        else:
+            sentences = [para]
+
+        for sent in sentences:
+            if not sent:
+                continue
+            candidate = f"{current} {sent}".strip() if current else sent
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+            if current:
+                chunks.append(current)
+                current = ""
+            if len(sent) <= max_chars:
+                current = sent
+            else:
+                # Hard split
+                for i in range(0, len(sent), max_chars):
+                    chunks.append(sent[i:i + max_chars])
+                current = ""
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def generate_podcast_audio(script: str, voice: str = "alloy", model: str = "tts-1"):
-    """Generate TTS audio bytes for a script."""
+    """Generate TTS audio bytes for a script, chunking to satisfy API limits."""
     url = "https://api.openai.com/v1/audio/speech"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": model,
-        "voice": voice,
-        "input": script,
-        "response_format": "mp3"
-    }
-    res = requests.post(url, headers=headers, json=payload, timeout=60)
-    if not res.ok:
-        raise HTTPException(status_code=500, detail=f"TTS failed: {res.text}")
-    return res.content, "audio/mpeg", voice, model
+
+    chunks = split_text_for_tts(script, max_chars=3800)
+    if not chunks:
+        raise HTTPException(status_code=500, detail="TTS failed: empty script")
+
+    audio_parts = []
+    for idx, chunk in enumerate(chunks, start=1):
+        payload = {
+            "model": model,
+            "voice": voice,
+            "input": chunk,
+            "response_format": "mp3"
+        }
+        res = requests.post(url, headers=headers, json=payload, timeout=60)
+        if not res.ok:
+            raise HTTPException(status_code=500, detail=f"TTS failed (chunk {idx}/{len(chunks)}): {res.text}")
+        audio_parts.append(res.content)
+
+    return b"".join(audio_parts), "audio/mpeg", voice, model
 
 
 # -------------------------
