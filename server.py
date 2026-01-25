@@ -245,6 +245,69 @@ def get_frontend_origin(request: Request) -> str:
 
 
 # -------------------------
+# MODELS
+# -------------------------
+class ExplainWord(BaseModel):
+    token: str
+    lemma: str
+    pos: str
+    morph: str
+    sentence: str
+    speaker: str | None = ""
+    work: str | None = ""
+
+
+class ExplainPassage(BaseModel):
+    work: str
+    section: str
+    speaker: Optional[str] = ""
+    greek: str
+    translation: Optional[str] = ""
+
+
+class SaveAnnotation(BaseModel):
+    work_id: str
+    section_id: str
+    token_id: Optional[str] = None
+    content: str
+    visibility: Optional[str] = "private"
+
+
+class Flashcard(BaseModel):
+    id: str
+    work_id: Optional[str] = None
+    section_id: Optional[str] = None
+    token_id: Optional[str] = None
+    text: Optional[str] = ""
+    lemma: Optional[str] = ""
+    gloss: Optional[str] = ""
+    morph: Optional[str] = ""
+    context: Optional[str] = ""
+    translation: Optional[str] = ""
+    created_at: Optional[str] = ""
+
+
+class FlashcardSet(BaseModel):
+    id: str
+    name: str
+    cards: List[Flashcard] = []
+    updated_at: Optional[str] = None
+
+
+class FlashcardSyncRequest(BaseModel):
+    sets: List[FlashcardSet] = []
+
+
+class PodcastGenerateRequest(BaseModel):
+    work_id: str
+    title: str
+    author: Optional[str] = ""
+    meta: Optional[str] = ""
+    sections: List[dict] = []
+    target_minutes: Optional[int] = 10
+
+
+# -------------------------
 # PODCAST HELPERS
 # -------------------------
 
@@ -319,69 +382,6 @@ def generate_podcast_audio(script: str, voice: str = "alloy", model: str = "tts-
     if not res.ok:
         raise HTTPException(status_code=500, detail=f"TTS failed: {res.text}")
     return res.content, "audio/mpeg", voice, model
-
-
-# -------------------------
-# MODELS
-# -------------------------
-class ExplainWord(BaseModel):
-    token: str
-    lemma: str
-    pos: str
-    morph: str
-    sentence: str
-    speaker: str | None = ""
-    work: str | None = ""
-
-
-class ExplainPassage(BaseModel):
-    work: str
-    section: str
-    speaker: Optional[str] = ""
-    greek: str
-    translation: Optional[str] = ""
-
-
-class SaveAnnotation(BaseModel):
-    work_id: str
-    section_id: str
-    token_id: Optional[str] = None
-    content: str
-    visibility: Optional[str] = "private"
-
-
-class Flashcard(BaseModel):
-    id: str
-    work_id: Optional[str] = None
-    section_id: Optional[str] = None
-    token_id: Optional[str] = None
-    text: Optional[str] = ""
-    lemma: Optional[str] = ""
-    gloss: Optional[str] = ""
-    morph: Optional[str] = ""
-    context: Optional[str] = ""
-    translation: Optional[str] = ""
-    created_at: Optional[str] = ""
-
-
-class FlashcardSet(BaseModel):
-    id: str
-    name: str
-    cards: List[Flashcard] = []
-    updated_at: Optional[str] = None
-
-
-class FlashcardSyncRequest(BaseModel):
-    sets: List[FlashcardSet] = []
-
-
-class PodcastGenerateRequest(BaseModel):
-    work_id: str
-    title: str
-    author: Optional[str] = ""
-    meta: Optional[str] = ""
-    sections: List[dict] = []
-    target_minutes: Optional[int] = 10
 
 
 # -------------------------
