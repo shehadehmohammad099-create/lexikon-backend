@@ -925,10 +925,10 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
         print(f"🎙️ script length={len(script)}")
 
         print("🎙️ generating audio…")
-    audio_bytes, audio_mime, voice, model = generate_podcast_audio(
-        script,
-        voices=req.voices or ["alloy", "nova"]
-    )
+        audio_bytes, audio_mime, voice, model = generate_podcast_audio(
+            script,
+            voices=req.voices or ["alloy", "nova"]
+        )
         print(f"🎙️ audio bytes={len(audio_bytes)} mime={audio_mime} voice={voice} model={model}")
 
         with get_db() as cur:
