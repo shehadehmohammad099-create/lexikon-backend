@@ -1203,4 +1203,14 @@ def get_user_id(request: Request) -> str | None:
 def require_pro_user(request: Request, allow_inactive: bool = False) -> str:
     """Return customer id from pro token. Optionally skip active sub check."""
     token = request.headers.get("X-Pro-Token")
-    custo
+    customer_id = customer_from_token(token)
+    if not customer_id:
+        raise HTTPException(status_code=402, detail="Pro required")
+
+    if allow_inactive:
+        return customer_id
+
+    if not has_pro(token):
+        raise HTTPException(status_code=402, detail="No active subscription")
+
+    return customer_id
