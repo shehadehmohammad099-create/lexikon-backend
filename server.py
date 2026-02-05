@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
 from typing import Optional, List
@@ -263,6 +263,22 @@ class ExplainPassage(BaseModel):
     speaker: Optional[str] = ""
     greek: str
     translation: Optional[str] = ""
+
+
+class LinkWord(BaseModel):
+    work_id: Optional[str] = ""
+    work_title: Optional[str] = ""
+    section_label: Optional[str] = ""
+    token: str
+    lemma: Optional[str] = ""
+    pos: Optional[str] = ""
+    morph: Optional[str] = ""
+    sentence: Optional[str] = ""
+
+
+class ExplainLink(BaseModel):
+    from_word: LinkWord = Field(..., alias="from")
+    to_word: LinkWord = Field(..., alias="to")
 
 
 class SaveAnnotation(BaseModel):
@@ -789,6 +805,60 @@ Context word/phrase: {req.sentence}
         )
 
 
+@app.post("/ai/explain-link")
+def explain_link(req: ExplainLink, request: Request):
+    try:
+        pro = request.headers.get("X-Pro-Token")
+        if not has_pro(pro):
+            raise HTTPException(status_code=402, detail="Pro required")
+
+        a = req.from_word
+        b = req.to_word
+
+        prompt = f"""
+You are a classical languages tutor. The student linked two words and wants a brief explanation of the link.
+Be concise (4-6 sentences). Focus on:
+- What each form tells us (lemma, POS, morphology).
+- How the two words relate (syntactic, semantic, thematic, or rhetorical).
+- One quick check-for-understanding question.
+
+Word A: {a.token}
+Lemma A: {a.lemma}
+POS A: {a.pos}
+Morph A: {a.morph}
+Context A: {a.sentence}
+Work A: {a.work_title} {a.section_label}
+
+Word B: {b.token}
+Lemma B: {b.lemma}
+POS B: {b.pos}
+Morph B: {b.morph}
+Context B: {b.sentence}
+Work B: {b.work_title} {b.section_label}
+"""
+
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a classical philologist."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=320,
+        )
+
+        return {"explanation": r.choices[0].message.content.strip()}
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print("AI ERROR:", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
 @app.post("/ai/explain-passage")
 def explain_passage(req: ExplainPassage, request: Request):
     try:
@@ -1133,378 +1203,4 @@ def get_user_id(request: Request) -> str | None:
 def require_pro_user(request: Request, allow_inactive: bool = False) -> str:
     """Return customer id from pro token. Optionally skip active sub check."""
     token = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(token)
-
-    if not customer_id:
-        raise HTTPException(status_code=401, detail="Pro token required")
-
-    if not allow_inactive and not has_pro(token):
-        raise HTTPException(status_code=402, detail="Pro subscription required")
-
-    return customer_id
-
-
-def process_text_with_stanza(text: str, language: str) -> List[dict]:
-    """Process text with Stanza and return sections with tokens."""
-    
-    # Split into sections by double newline (paragraphs)
-    raw_sections = re.split(r'\n\s*\n', text.strip())
-    
-    # If no paragraphs found or very few, split by ~500 words
-    if len(raw_sections) <= 1:
-        words = text.split()
-        raw_sections = []
-        for i in range(0, len(words), 500):
-            raw_sections.append(' '.join(words[i:i+500]))
-    
-    # Limit sections to prevent huge processing times
-    raw_sections = raw_sections[:50]  # Max 50 sections
-    
-    nlp = get_stanza_pipeline(language)
-    sections = []
-    
-    for idx, section_text in enumerate(raw_sections):
-        section_text = section_text.strip()
-        if not section_text:
-            continue
-            
-        # Process with Stanza
-        doc = nlp(section_text)
-        
-        tokens = []
-        token_idx = 0
-        
-        for sentence in doc.sentences:
-            for word in sentence.words:
-                tokens.append({
-                    "id": f"w{token_idx}",
-                    "t": word.text,
-                    "lemma": word.lemma or word.text,
-                    "pos": word.upos or "",
-                    "morph": word.feats or ""
-                })
-                token_idx += 1
-        
-        sections.append({
-            "id": f"section_{idx + 1}",
-            "label": f"Section {idx + 1}",
-            "tokens": tokens,
-            "translation": ""  # User can add later if they want
-        })
-    
-    return sections
-
-
-def count_words(text: str) -> int:
-    """Count words in text."""
-    return len(text.split())
-
-
-@app.post("/texts/upload")
-async def upload_text(
-    request: Request,
-    file: UploadFile = File(...),
-    title: str = Form(...),
-    language: str = Form(...)  # "en", "grc", "la"
-):
-    """Upload and process a text file. Processing is free for all users.
-    Cloud storage is only for Pro users; all users get the processed result
-    to save in localStorage."""
-    
-    # Get user identifier (may be None for non-Pro users)
-    user_id = get_user_id(request)
-    
-    # Read file
-    try:
-        content = await file.read()
-        text = content.decode('utf-8')
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
-    
-    # Validate word count
-    word_count = count_words(text)
-    if word_count > 10000:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Text too long ({word_count} words). Maximum is 10,000 words."
-        )
-    
-    if word_count < 10:
-        raise HTTPException(
-            status_code=400,
-            detail="Text too short. Please upload at least 10 words."
-        )
-    
-    # Validate language
-    if language not in ["en", "grc", "la"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Language must be 'en' (English), 'grc' (Ancient Greek), or 'la' (Latin)"
-        )
-    
-    # Process text
-    try:
-        user_display = (user_id[:20] + "...") if user_id else "anonymous"
-        print(f"📝 Processing {word_count} words in {language} for user {user_display}...")
-        sections = process_text_with_stanza(text, language)
-        print(f"✅ Created {len(sections)} sections")
-    except Exception as e:
-        print(f"❌ Processing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-    
-    # Generate unique ID for this text
-    text_id = f"user_{secrets.token_urlsafe(12)}"
-    
-    # Save to database (only for Pro users)
-    if user_id:
-        with get_db() as cur:
-            cur.execute("""
-            INSERT INTO user_texts (id, user_id, title, language, sections)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO UPDATE SET
-                title = EXCLUDED.title,
-                sections = EXCLUDED.sections
-            """, (text_id, user_id, title, language, Json(sections)))
-    
-    # Return sections so frontend can save to localStorage
-    return {
-        "id": text_id,
-        "title": title,
-        "language": language,
-        "sections": sections,
-        "section_count": len(sections),
-        "word_count": word_count
-    }
-
-
-class SaveTextRequest(BaseModel):
-    id: str
-    title: str
-    language: str
-    sections: List[dict]
-
-
-@app.post("/texts/save")
-def save_text(req: SaveTextRequest, request: Request):
-    """Save a pre-processed text to cloud (for migration/sync). Pro only."""
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
-    
-    if not customer_id:
-        raise HTTPException(status_code=401, detail="Pro subscription required")
-    
-    with get_db() as cur:
-        cur.execute("""
-        INSERT INTO user_texts (id, user_id, title, language, sections)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO UPDATE SET
-            title = EXCLUDED.title,
-            sections = EXCLUDED.sections
-        """, (req.id, customer_id, req.title, req.language, Json(req.sections)))
-    
-    return {"ok": True}
-
-
-@app.get("/texts")
-def list_user_texts(request: Request):
-    """List all texts uploaded by the current user."""
-    user_id = get_user_id(request)
-    
-    if not user_id:
-        return {"texts": [], "message": "No user ID provided"}
-    
-    with get_db() as cur:
-        cur.execute("""
-        SELECT id, title, language, created_at,
-               jsonb_array_length(sections) as section_count
-        FROM user_texts
-        WHERE user_id = %s
-        ORDER BY created_at DESC
-        """, (user_id,))
-        
-        rows = cur.fetchall()
-        
-        texts = []
-        for r in rows:
-            texts.append({
-                "id": r["id"],
-                "title": r["title"],
-                "language": r["language"],
-                "section_count": r["section_count"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None
-            })
-        
-        return {"texts": texts}
-
-
-@app.get("/texts/{text_id}")
-def get_user_text(text_id: str, request: Request):
-    """Get a specific user text with all sections."""
-    user_id = get_user_id(request)
-    
-    with get_db() as cur:
-        cur.execute("""
-        SELECT id, user_id, title, language, sections
-        FROM user_texts
-        WHERE id = %s
-        """, (text_id,))
-        
-        row = cur.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail="Text not found")
-        
-        # Check ownership (only owner can access)
-        if user_id and row["user_id"] != user_id:
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        # If no user_id provided, still allow access if they know the text_id
-        # (useful for sharing links in the future)
-        
-        return {
-            "id": row["id"],
-            "title": row["title"],
-            "language": row["language"],
-            "sections": row["sections"]
-        }
-
-
-@app.delete("/texts/{text_id}")
-def delete_user_text(text_id: str, request: Request):
-    """Delete a user text."""
-    user_id = get_user_id(request)
-    
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    
-    with get_db() as cur:
-        # Check ownership first
-        cur.execute("""
-        SELECT user_id FROM user_texts WHERE id = %s
-        """, (text_id,))
-        
-        row = cur.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail="Text not found")
-        
-        if row["user_id"] != user_id:
-            raise HTTPException(status_code=403, detail="Access denied")
-        
-        # Delete
-        cur.execute("DELETE FROM user_texts WHERE id = %s", (text_id,))
-        
-        # Also delete any annotations for this text
-        cur.execute("""
-        DELETE FROM annotations WHERE work_id = %s AND customer_id = %s
-        """, (text_id, user_id))
-    
-    return {"ok": True}
-
-
-# -------------------------
-# FLASHCARD ENDPOINTS
-# -------------------------
-
-@app.get("/flashcards")
-def list_flashcards(request: Request):
-    """Return all flashcard sets for the current Pro user."""
-    pro = request.headers.get("X-Pro-Token")
-    customer_id = customer_from_token(pro)
-
-    if not customer_id:
-        return {"sets": []}
-
-    with get_db() as cur:
-        cur.execute("""
-        SELECT id, name, cards, updated_at
-        FROM flashcard_sets
-        WHERE user_id = %s
-        ORDER BY updated_at DESC
-        """, (customer_id,))
-
-        rows = cur.fetchall() or []
-        return {"sets": rows}
-
-
-@app.post("/flashcards")
-def save_flashcard_set(req: FlashcardSet, request: Request):
-    """Upsert a single flashcard set for the user."""
-    customer_id = require_pro_user(request)
-    updated_at = req.updated_at or datetime.utcnow().isoformat()
-
-    with get_db() as cur:
-        cur.execute("""
-        INSERT INTO flashcard_sets (user_id, id, name, cards, updated_at)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (user_id, id)
-        DO UPDATE SET
-          name = EXCLUDED.name,
-          cards = EXCLUDED.cards,
-          updated_at = EXCLUDED.updated_at
-        """, (
-            customer_id,
-            req.id,
-            req.name,
-            Json([c.dict() if hasattr(c, "dict") else c for c in (req.cards or [])]),
-            updated_at
-        ))
-
-    return {"ok": True}
-
-
-@app.post("/flashcards/sync")
-def sync_flashcards(req: FlashcardSyncRequest, request: Request):
-    """Replace all flashcard sets for the user (used for migration/sync)."""
-    customer_id = require_pro_user(request)
-
-    with get_db() as cur:
-        cur.execute("DELETE FROM flashcard_sets WHERE user_id = %s", (customer_id,))
-
-        for s in req.sets:
-            updated_at = s.updated_at or datetime.utcnow().isoformat()
-            cur.execute("""
-            INSERT INTO flashcard_sets (user_id, id, name, cards, updated_at)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (user_id, id)
-            DO UPDATE SET
-              name = EXCLUDED.name,
-              cards = EXCLUDED.cards,
-              updated_at = EXCLUDED.updated_at
-            """, (
-                customer_id,
-                s.id,
-                s.name,
-                Json([c.dict() if hasattr(c, "dict") else c for c in (s.cards or [])]),
-                updated_at
-            ))
-
-    return {"ok": True}
-
-
-@app.delete("/flashcards/{set_id}")
-def delete_flashcard_set(set_id: str, request: Request):
-    """Delete a single set. allow_inactive=True so users can clean up after downgrading."""
-    customer_id = require_pro_user(request, allow_inactive=True)
-
-    with get_db() as cur:
-        cur.execute("""
-        DELETE FROM flashcard_sets
-        WHERE user_id = %s AND id = %s
-        """, (customer_id, set_id))
-
-    return {"ok": True}
-
-
-@app.delete("/flashcards")
-def delete_all_flashcards(request: Request):
-    """Delete all flashcard sets for a user (used when moving off Pro)."""
-    customer_id = require_pro_user(request, allow_inactive=True)
-
-    with get_db() as cur:
-        cur.execute("""
-        DELETE FROM flashcard_sets
-        WHERE user_id = %s
-        """, (customer_id,))
-
-    return {"ok": True}
+    custo
