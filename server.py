@@ -1214,3 +1214,278 @@ def require_pro_user(request: Request, allow_inactive: bool = False) -> str:
         raise HTTPException(status_code=402, detail="No active subscription")
 
     return customer_id
+
+
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def process_text_with_stanza(text: str, language: str) -> List[dict]:
+    """Process text with Stanza and return sections with tokens."""
+    raw_sections = re.split(r'\n\s*\n', text.strip())
+
+    if len(raw_sections) <= 1:
+        words = text.split()
+        raw_sections = []
+        for i in range(0, len(words), 500):
+            raw_sections.append(' '.join(words[i:i + 500]))
+
+    raw_sections = raw_sections[:50]
+
+    nlp = get_stanza_pipeline(language)
+    sections = []
+
+    for idx, section_text in enumerate(raw_sections):
+        section_text = section_text.strip()
+        if not section_text:
+            continue
+
+        doc = nlp(section_text)
+        tokens = []
+        token_idx = 0
+
+        for sentence in doc.sentences:
+            for word in sentence.words:
+                tokens.append({
+                    "id": f"w{token_idx}",
+                    "t": word.text,
+                    "lemma": word.lemma or word.text,
+                    "pos": word.upos or "",
+                    "morph": word.feats or ""
+                })
+                token_idx += 1
+
+        sections.append({
+            "id": f"section_{idx + 1}",
+            "label": f"Section {idx + 1}",
+            "tokens": tokens,
+            "translation": ""
+        })
+
+    return sections
+
+
+@app.post("/texts/upload")
+async def upload_text(
+    request: Request,
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    language: str = Form(...)
+):
+    """Upload and process a text file. Processing is free for all users."""
+    user_id = get_user_id(request)
+
+    try:
+        content = await file.read()
+        text = content.decode('utf-8')
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+
+    word_count = count_words(text)
+    if word_count > 10000:
+        raise HTTPException(status_code=400, detail=f"Text too long ({word_count} words). Maximum is 10,000 words.")
+    if word_count < 10:
+        raise HTTPException(status_code=400, detail="Text too short. Please upload at least 10 words.")
+
+    if language not in ["en", "grc", "la"]:
+        raise HTTPException(status_code=400, detail="Language must be 'en', 'grc', or 'la'")
+
+    try:
+        user_display = (user_id[:20] + "...") if user_id else "anonymous"
+        print(f"📝 Processing {word_count} words in {language} for user {user_display}...")
+        sections = process_text_with_stanza(text, language)
+        print(f"✅ Created {len(sections)} sections")
+    except Exception as e:
+        print(f"❌ Processing error: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+
+    text_id = f"user_{secrets.token_urlsafe(12)}"
+
+    if user_id:
+        with get_db() as cur:
+            cur.execute("""
+            INSERT INTO user_texts (id, user_id, title, language, sections)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                sections = EXCLUDED.sections
+            """, (text_id, user_id, title, language, Json(sections)))
+
+    return {
+        "id": text_id,
+        "title": title,
+        "language": language,
+        "sections": sections,
+        "section_count": len(sections),
+        "word_count": word_count
+    }
+
+
+class SaveTextRequest(BaseModel):
+    id: str
+    title: str
+    language: str
+    sections: List[dict]
+
+
+@app.post("/texts/save")
+def save_text(req: SaveTextRequest, request: Request):
+    """Save a pre-processed text to cloud (for migration/sync). Pro only."""
+    customer_id = require_pro_user(request)
+
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO user_texts (id, user_id, title, language, sections)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            title = EXCLUDED.title,
+            sections = EXCLUDED.sections
+        """, (req.id, customer_id, req.title, req.language, Json(req.sections)))
+
+    return {"ok": True}
+
+
+@app.get("/texts")
+def list_user_texts(request: Request):
+    """List all texts uploaded by the current user."""
+    user_id = get_user_id(request)
+    if not user_id:
+        return {"texts": []}
+
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, title, language, created_at,
+               jsonb_array_length(sections) as section_count
+        FROM user_texts
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        """, (user_id,))
+
+        rows = cur.fetchall()
+        texts = []
+        for r in rows or []:
+            texts.append({
+                "id": r["id"],
+                "title": r["title"],
+                "language": r["language"],
+                "section_count": r["section_count"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            })
+
+        return {"texts": texts}
+
+
+@app.get("/texts/{text_id}")
+def get_user_text(text_id: str, request: Request):
+    """Get a specific user text with all sections."""
+    user_id = get_user_id(request)
+
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, user_id, title, language, sections
+        FROM user_texts
+        WHERE id = %s
+        """, (text_id,))
+
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Text not found")
+
+        if user_id and row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "language": row["language"],
+            "sections": row["sections"]
+        }
+
+
+@app.delete("/texts/{text_id}")
+def delete_user_text(text_id: str, request: Request):
+    """Delete a user text."""
+    user_id = get_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    with get_db() as cur:
+        cur.execute("""
+        SELECT user_id FROM user_texts WHERE id = %s
+        """, (text_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Text not found")
+        if row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+        cur.execute("DELETE FROM user_texts WHERE id = %s", (text_id,))
+        cur.execute("""
+        DELETE FROM annotations WHERE work_id = %s AND customer_id = %s
+        """, (text_id, user_id))
+
+    return {"ok": True}
+
+
+@app.get("/flashcards")
+def list_flashcards(request: Request):
+    """Return all flashcard sets for the current Pro user."""
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"sets": []}
+
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, name, cards, updated_at
+        FROM flashcard_sets
+        WHERE user_id = %s
+        ORDER BY updated_at DESC
+        """, (customer_id,))
+        rows = cur.fetchall() or []
+        return {"sets": rows}
+
+
+@app.post("/flashcards/sync")
+def sync_flashcards(req: FlashcardSyncRequest, request: Request):
+    """Replace all flashcard sets for the user (used for migration/sync)."""
+    customer_id = require_pro_user(request)
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM flashcard_sets WHERE user_id = %s
+        """, (customer_id,))
+
+        for s in req.sets or []:
+            updated_at = s.updated_at or datetime.utcnow().isoformat()
+            cur.execute("""
+            INSERT INTO flashcard_sets (user_id, id, name, cards, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, id)
+            DO UPDATE SET
+              name = EXCLUDED.name,
+              cards = EXCLUDED.cards,
+              updated_at = EXCLUDED.updated_at
+            """, (
+                customer_id,
+                s.id,
+                s.name,
+                Json([c.dict() if hasattr(c, "dict") else c for c in (s.cards or [])]),
+                updated_at
+            ))
+
+    return {"ok": True}
+
+
+@app.delete("/flashcards")
+def delete_all_flashcards(request: Request):
+    """Delete all flashcard sets for a user (used when moving off Pro)."""
+    customer_id = require_pro_user(request, allow_inactive=True)
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM flashcard_sets
+        WHERE user_id = %s
+        """, (customer_id,))
+
+    return {"ok": True}
