@@ -155,6 +155,15 @@ def init_db():
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS free_ai_credits (
+          user_id TEXT PRIMARY KEY,
+          used INT NOT NULL DEFAULT 0,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
 init_db()
 
 
@@ -175,6 +184,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 FRONTEND_URL = os.environ["FRONTEND_URL"]
+FREE_AI_CREDITS = int(os.environ.get("FREE_AI_CREDITS", "20"))
 
 openai.api_key = OPENAI_API_KEY
 stripe.api_key = STRIPE_SECRET_KEY
@@ -217,6 +227,72 @@ def has_pro(pro_token: str | None) -> bool:
 
 
     return FRONTEND_URL
+
+
+def get_anon_id(request: Request) -> str | None:
+    anon_id = request.headers.get("X-Anon-ID")
+    if anon_id and anon_id.startswith("anon_"):
+        return anon_id
+    return None
+
+
+def get_free_ai_remaining(request: Request) -> int:
+    anon_id = get_anon_id(request)
+    if not anon_id:
+        raise HTTPException(status_code=401, detail="Anonymous ID required")
+
+    limit = FREE_AI_CREDITS
+    with get_db() as cur:
+        cur.execute("SELECT used FROM free_ai_credits WHERE user_id = %s", (anon_id,))
+        row = cur.fetchone()
+        used = row["used"] if row else 0
+
+    return max(limit - used, 0)
+
+
+def consume_free_ai_credit(request: Request) -> int:
+    anon_id = get_anon_id(request)
+    if not anon_id:
+        raise HTTPException(status_code=401, detail="Anonymous ID required")
+
+    limit = FREE_AI_CREDITS
+
+    with get_db() as cur:
+        cur.execute("""
+        UPDATE free_ai_credits
+        SET used = used + 1, updated_at = NOW()
+        WHERE user_id = %s AND used < %s
+        RETURNING used
+        """, (anon_id, limit))
+        row = cur.fetchone()
+        if row:
+            used = row["used"]
+            return max(limit - used, 0)
+
+        cur.execute("""
+        INSERT INTO free_ai_credits (user_id, used)
+        VALUES (%s, 1)
+        ON CONFLICT DO NOTHING
+        RETURNING used
+        """, (anon_id,))
+        row = cur.fetchone()
+        if row:
+            used = row["used"]
+            return max(limit - used, 0)
+
+        cur.execute("SELECT used FROM free_ai_credits WHERE user_id = %s", (anon_id,))
+        row = cur.fetchone()
+        used = row["used"] if row else limit
+        remaining = max(limit - used, 0)
+
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "error": "Free AI credits exhausted",
+            "remaining_credits": remaining,
+            "limit": limit
+        }
+    )
 
 
 def clean_origin(origin: str) -> str:
@@ -761,12 +837,23 @@ def billing_restore_token(session_id: str):
 # AI ENDPOINTS
 # -------------------------
 
+@app.get("/ai/credits")
+def ai_credits(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    if has_pro(pro):
+        return {"pro": True, "remaining_credits": None, "limit": None}
+
+    remaining = get_free_ai_remaining(request)
+    return {"pro": False, "remaining_credits": remaining, "limit": FREE_AI_CREDITS}
+
+
 @app.post("/ai/explain-word")
 def explain_word(req: ExplainWord, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
+        remaining = None
         if not has_pro(pro):
-            raise HTTPException(status_code=402, detail="Pro required")
+            remaining = consume_free_ai_credit(request)
 
         prompt = f"""
 You are a classical languages tutor. Give a concise, pointed coaching note (not an info dump).
@@ -793,7 +880,11 @@ Context word/phrase: {req.sentence}
             max_tokens=300,
         )
 
-        return {"explanation": r.choices[0].message.content.strip()}
+        return {
+            "explanation": r.choices[0].message.content.strip(),
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS
+        }
 
     except HTTPException as e:
         raise e
@@ -809,8 +900,9 @@ Context word/phrase: {req.sentence}
 def explain_link(req: ExplainLink, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
+        remaining = None
         if not has_pro(pro):
-            raise HTTPException(status_code=402, detail="Pro required")
+            remaining = consume_free_ai_credit(request)
 
         a = req.from_word
         b = req.to_word
@@ -847,7 +939,11 @@ Work B: {b.work_title} {b.section_label}
             max_tokens=320,
         )
 
-        return {"explanation": r.choices[0].message.content.strip()}
+        return {
+            "explanation": r.choices[0].message.content.strip(),
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS
+        }
 
     except HTTPException as e:
         raise e
@@ -863,8 +959,9 @@ Work B: {b.work_title} {b.section_label}
 def explain_passage(req: ExplainPassage, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
+        remaining = None
         if not has_pro(pro):
-            raise HTTPException(status_code=402, detail="Pro required")
+            remaining = consume_free_ai_credit(request)
 
         prompt = f"""
 You are a classical languages tutor. Give a short, structured walkthrough to help a student read the passage (not a summary).
@@ -895,7 +992,11 @@ Translation (for reference only):
             max_tokens=500,
         )
 
-        return {"explanation": r.choices[0].message.content.strip()}
+        return {
+            "explanation": r.choices[0].message.content.strip(),
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS
+        }
 
     except HTTPException as e:
         raise e
