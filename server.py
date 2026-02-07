@@ -184,7 +184,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 FRONTEND_URL = os.environ["FRONTEND_URL"]
-FREE_AI_CREDITS = int(os.environ.get("FREE_AI_CREDITS", "20"))
+FREE_AI_CREDITS = int(os.environ.get("FREE_AI_CREDITS", "5"))
 
 openai.api_key = OPENAI_API_KEY
 stripe.api_key = STRIPE_SECRET_KEY
