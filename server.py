@@ -46,6 +46,7 @@ def ensure_google_credentials_file():
     except Exception:
         pass
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
+    print(f"✅ Google Vision credentials loaded from env into {path}")
 
 
 ensure_google_credentials_file()
@@ -1428,7 +1429,8 @@ async def ocr_vision(
         image = vision.Image(content=content)
         response = client.document_text_detection(image=image)
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Vision OCR request failed") from e
+        print(f"❌ Vision OCR request failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Vision OCR request failed: {e}") from e
 
     if response.error and response.error.message:
         raise HTTPException(status_code=500, detail=f"Vision OCR error: {response.error.message}")
