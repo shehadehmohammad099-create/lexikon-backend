@@ -18,11 +18,37 @@ from contextlib import contextmanager
 import json
 import stanza
 import re
+from pathlib import Path
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
+
+def ensure_google_credentials_file():
+    """Create a temp service-account JSON file from env var for Google clients."""
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        return
+
+    raw = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not raw:
+        return
+
+    try:
+        json.loads(raw)
+    except Exception as e:
+        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON") from e
+
+    path = Path("/tmp/gcp-sa.json")
+    path.write_text(raw)
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
+
+
+ensure_google_credentials_file()
 
 
 # Initialize Stanza pipelines (downloaded on first use)
@@ -1364,6 +1390,54 @@ def process_text_with_stanza(text: str, language: str) -> List[dict]:
         })
 
     return sections
+
+
+def _get_vision_client():
+    try:
+        from google.cloud import vision  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="google-cloud-vision not installed") from e
+    return vision.ImageAnnotatorClient()
+
+
+@app.post("/ocr/vision")
+async def ocr_vision(
+    request: Request,
+    file: UploadFile = File(...)
+):
+    """Run Google Vision OCR (DOCUMENT_TEXT_DETECTION) on an image."""
+    if not file:
+        raise HTTPException(status_code=400, detail="No image provided")
+
+    # Basic content-type check
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty image")
+
+    # 5MB limit to avoid surprise costs and timeouts
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image too large (max 5MB)")
+
+    client = _get_vision_client()
+
+    try:
+        from google.cloud import vision  # type: ignore
+        image = vision.Image(content=content)
+        response = client.document_text_detection(image=image)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Vision OCR request failed") from e
+
+    if response.error and response.error.message:
+        raise HTTPException(status_code=500, detail=f"Vision OCR error: {response.error.message}")
+
+    text = ""
+    if response.full_text_annotation and response.full_text_annotation.text:
+        text = response.full_text_annotation.text
+
+    return {"text": text}
 
 
 @app.post("/texts/upload")
