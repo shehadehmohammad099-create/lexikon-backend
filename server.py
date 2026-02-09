@@ -1380,6 +1380,39 @@ def get_work_annotations(work_id: str, request: Request):
         return {"annotations": []}
 
 
+@app.get("/annotations/all")
+def get_all_annotations(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+
+    if not customer_id:
+        return {"annotations": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT work_id, section_id, token_id, content
+            FROM annotations
+            WHERE customer_id = %s
+            """, (customer_id,))
+
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                if not r:
+                    continue
+                out.append({
+                    "work_id": r.get("work_id"),
+                    "section_id": r.get("section_id"),
+                    "token_id": r.get("token_id"),
+                    "content": r.get("content")
+                })
+            return {"annotations": out}
+    except Exception as e:
+        print(f"Error fetching all annotations: {e}")
+        return {"annotations": []}
+
+
 @app.get("/annotations/public")
 def get_public_annotations(work_id: str, section_id: str):
     try:
