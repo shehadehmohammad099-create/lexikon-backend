@@ -437,10 +437,10 @@ class PodcastGenerateRequest(BaseModel):
 
 
 class AnnotationRow(BaseModel):
-    section: str
-    token: str
-    lemma: str
-    body: str
+    section: Optional[str] = ""
+    token: Optional[str] = ""
+    lemma: Optional[str] = ""
+    body: Optional[str] = ""
 
 
 class EmailAnnotationsRequest(BaseModel):
@@ -1345,6 +1345,39 @@ def get_annotations(work_id: str, section_id: str, request: Request):
     except Exception as e:
         print(f"Error fetching annotations: {e}")
         return {"annotations": {}}
+
+
+@app.get("/annotations/work")
+def get_work_annotations(work_id: str, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+
+    if not customer_id:
+        return {"annotations": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT section_id, token_id, content
+            FROM annotations
+            WHERE customer_id = %s
+              AND work_id = %s
+            """, (customer_id, work_id))
+
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                if not r:
+                    continue
+                out.append({
+                    "section_id": r.get("section_id"),
+                    "token_id": r.get("token_id"),
+                    "content": r.get("content")
+                })
+            return {"annotations": out}
+    except Exception as e:
+        print(f"Error fetching work annotations: {e}")
+        return {"annotations": []}
 
 
 @app.get("/annotations/public")
