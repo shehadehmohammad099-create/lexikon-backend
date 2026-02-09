@@ -191,6 +191,15 @@ def init_db():
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS email_list (
+          email TEXT PRIMARY KEY,
+          source TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
 init_db()
 
 
@@ -427,6 +436,20 @@ class PodcastGenerateRequest(BaseModel):
     voices: Optional[List[str]] = ["alloy", "nova"]
 
 
+class AnnotationRow(BaseModel):
+    section: str
+    token: str
+    lemma: str
+    body: str
+
+
+class EmailAnnotationsRequest(BaseModel):
+    email: str
+    work_id: Optional[str] = ""
+    work_title: Optional[str] = ""
+    rows: List[AnnotationRow] = []
+
+
 # -------------------------
 # PODCAST HELPERS
 # -------------------------
@@ -617,6 +640,101 @@ def send_restore_email(to_email: str, restore_url: str):
             
     except Exception as e:
         print(f"❌ Failed to send restore email: {e}")
+
+
+def html_escape(val: str) -> str:
+    return (
+        str(val or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def send_annotations_email(to_email: str, work_title: str, rows: List[AnnotationRow]):
+    safe_title = html_escape(work_title or "Annotations")
+    row_html = "".join(
+        f"<tr>"
+        f"<td>{html_escape(r.section)}</td>"
+        f"<td>{html_escape(r.token)}</td>"
+        f"<td>{html_escape(r.lemma)}</td>"
+        f"<td>{html_escape(r.body)}</td>"
+        f"</tr>"
+        for r in rows
+    )
+    html = f"""
+        <p>Here are your Lexikon annotations for <strong>{safe_title}</strong>.</p>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:6px;">Section</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:6px;">Token</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:6px;">Lemma</th>
+              <th style="text-align:left;border-bottom:1px solid #ddd;padding:6px;">Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {row_html}
+          </tbody>
+        </table>
+        <p style="color:#666;font-size:12px;">Exported from Lexikon.</p>
+    """
+
+    text_lines = ["Lexikon annotations", f"Work: {work_title}", ""]
+    for r in rows:
+        text_lines.append(f"{r.section} | {r.token} | {r.lemma} | {r.body}")
+    text = "\n".join(text_lines)
+
+    try:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Lexikon <hello@the-lexicon-project.com>",
+                "to": to_email,
+                "subject": f"Your Lexikon annotations — {work_title}",
+                "html": html,
+                "text": text,
+            },
+            timeout=8,
+        )
+
+        if response.ok:
+            print(f"✅ Annotation email sent to {to_email}")
+        else:
+            print(f"❌ Resend API error: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=502, detail="Email failed")
+
+    except Exception as e:
+        print(f"❌ Failed to send annotations email: {e}")
+        raise HTTPException(status_code=502, detail="Email failed")
+
+
+@app.post("/email/annotations")
+def email_annotations(payload: EmailAnnotationsRequest):
+    email = (payload.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="No annotations to send")
+
+    with get_db() as cur:
+        cur.execute(
+            """
+            INSERT INTO email_list (email, source, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (email) DO UPDATE
+            SET source = EXCLUDED.source,
+                updated_at = NOW()
+            """,
+            (email, f"export:{payload.work_id or 'unknown'}"),
+        )
+
+    send_annotations_email(email, payload.work_title or "Annotations", payload.rows)
+    return {"ok": True}
 
 
 # -------------------------
