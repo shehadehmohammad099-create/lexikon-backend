@@ -403,11 +403,17 @@ class ExplainPassage(BaseModel):
     prompt_memory: Optional[str] = ""
 
 
+class WorkAnnotationToken(BaseModel):
+    id: str
+    text: str
+
+
 class WorkAnnotationSection(BaseModel):
     id: Optional[str] = ""
     label: Optional[str] = ""
     text: str
     translation: Optional[str] = ""
+    tokens: List[WorkAnnotationToken] = []
 
 
 class AnnotateWorkRequest(BaseModel):
@@ -1408,15 +1414,29 @@ Use this as supporting context when helpful, but prioritize the source text.
 """
 
         normalized_sections = []
+        allowed_tokens_by_section = {}
         for sec in req.sections[:MAX_WORK_ANNOTATE_SECTIONS]:
             text = (sec.text or "").strip()
             if not text:
                 continue
+            section_id = (sec.id or "").strip()
+            normalized_tokens = []
+            for tok in sec.tokens:
+                token_id = (tok.id or "").strip()
+                token_text = (tok.text or "").strip()
+                if not token_id or not token_text:
+                    continue
+                normalized_tokens.append({
+                    "id": token_id,
+                    "text": token_text[:64]
+                })
+            allowed_tokens_by_section[section_id] = {t["id"] for t in normalized_tokens}
             normalized_sections.append({
-                "id": (sec.id or "").strip(),
+                "id": section_id,
                 "label": (sec.label or sec.id or "").strip(),
                 "text": text[:MAX_WORK_ANNOTATE_SECTION_CHARS],
-                "translation": (sec.translation or "").strip()[:MAX_WORK_ANNOTATE_SECTION_CHARS]
+                "translation": (sec.translation or "").strip()[:MAX_WORK_ANNOTATE_SECTION_CHARS],
+                "tokens": normalized_tokens
             })
 
         if not normalized_sections:
@@ -1424,32 +1444,46 @@ Use this as supporting context when helpful, but prioritize the source text.
 
         section_blocks = []
         for sec in normalized_sections:
+            token_lines = "\n".join([
+                f'- {tok["id"]}: {tok["text"]}'
+                for tok in sec["tokens"]
+            ]) or "- (no tokens supplied)"
             section_blocks.append(
                 f"""[{sec["label"] or sec["id"] or "section"}]
+section_id: {sec["id"]}
 Original:
 {sec["text"]}
 Translation:
-{sec["translation"]}"""
+{sec["translation"]}
+Allowed tokens for annotations:
+{token_lines}"""
             )
         sections_text = "\n\n".join(section_blocks)
 
         prompt = f"""
 You are a classical philologist and writing coach.
-Generate compact section-level annotations for a student reading this work.
+Generate compact style/content annotations and map each one to a token id.
 
 Output format:
-- Start with "Overview:" and write 3 bullets about the whole work's style/content profile.
-- Then write "Section notes:" and for each provided section write:
-  [section label]
-  - Style: one short bullet about stylistic/rhetorical feature(s)
-  - Content: one short bullet about conceptual/narrative point(s)
-  - Reading cue: one short bullet helping the student read that section
+- Return strict JSON only, no markdown, no prose outside JSON.
+- JSON schema:
+  {{
+    "overview": ["...", "...", "..."],
+    "annotations": [
+      {{
+        "section_id": "exact section_id from input",
+        "token_id": "exact token id from that section's allowed tokens",
+        "note": "short annotation for style/content reading"
+      }}
+    ]
+  }}
 
 Rules:
-- Keep each bullet under 24 words.
-- Be specific to the supplied text.
-- Do not invent citations or quote line numbers not provided.
-- Do not output JSON.
+- 1-2 annotations per section; max 2.
+- Each note under 28 words.
+- Notes should mention style and/or content insight useful for reading.
+- Use only provided section_id/token_id values.
+- Be specific to supplied text; no invented citations.
 
 Work title: {req.work_title}
 Author: {req.author}
@@ -1470,8 +1504,57 @@ Sections provided: {len(normalized_sections)}
             max_tokens=1200,
         )
 
+        raw = (r.choices[0].message.content or "").strip()
+        parsed = None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, flags=re.S)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    parsed = None
+
+        overview = []
+        annotations = []
+        if isinstance(parsed, dict):
+            ov = parsed.get("overview")
+            if isinstance(ov, list):
+                overview = [str(x).strip() for x in ov if str(x).strip()][:6]
+
+            rows = parsed.get("annotations")
+            if isinstance(rows, list):
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    section_id = str(item.get("section_id") or "").strip()
+                    token_id = str(item.get("token_id") or "").strip()
+                    note = str(item.get("note") or "").strip()
+                    if not section_id or not token_id or not note:
+                        continue
+                    allowed = allowed_tokens_by_section.get(section_id) or set()
+                    if token_id not in allowed:
+                        continue
+                    annotations.append({
+                        "section_id": section_id,
+                        "token_id": token_id,
+                        "note": note[:320]
+                    })
+
+        if not overview:
+            overview = ["AI auto-annotation generated."]
+
+        if annotations:
+            explanation = "Overview:\n" + "\n".join([f"- {line}" for line in overview])
+            explanation += f"\n\nSaved annotation candidates: {len(annotations)}"
+        else:
+            explanation = "Overview:\n" + "\n".join([f"- {line}" for line in overview])
+            explanation += "\n\nNo token-level annotations were generated."
+
         return {
-            "explanation": r.choices[0].message.content.strip(),
+            "explanation": explanation,
+            "annotations": annotations,
             "remaining_credits": remaining,
             "limit": FREE_AI_CREDITS,
             "sections_analyzed": len(normalized_sections),
