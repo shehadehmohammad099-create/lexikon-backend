@@ -1428,10 +1428,54 @@ def get_podcast_audio(work_id: str, request: Request):
     size = len(audio_data) if audio_data else 0
     print(f"🎧 audio bytes={size} work_id={work_id} customer_id={customer_id}")
 
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    if range_header and range_header.startswith("bytes=") and size > 0:
+        try:
+            spec = range_header.split("=", 1)[1].strip()
+            start_s, end_s = (spec.split("-", 1) + [""])[:2]
+
+            if start_s == "":
+                # suffix form: bytes=-N
+                suffix_len = int(end_s)
+                if suffix_len <= 0:
+                    raise ValueError("Invalid suffix length")
+                start = max(size - suffix_len, 0)
+                end = size - 1
+            else:
+                start = int(start_s)
+                end = int(end_s) if end_s else size - 1
+
+            if start < 0 or end < start or start >= size:
+                raise ValueError("Invalid range bounds")
+
+            end = min(end, size - 1)
+            chunk = audio_data[start:end + 1]
+
+            return Response(
+                content=chunk,
+                status_code=206,
+                media_type=row.get("audio_mime") or "audio/mpeg",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                    "Content-Length": str(len(chunk)),
+                    "Cache-Control": "private, max-age=3600"
+                }
+            )
+        except Exception:
+            return Response(
+                status_code=416,
+                headers={
+                    "Content-Range": f"bytes */{size}",
+                    "Accept-Ranges": "bytes"
+                }
+            )
+
     return Response(
         content=audio_data,
         media_type=row.get("audio_mime") or "audio/mpeg",
         headers={
+            "Accept-Ranges": "bytes",
             "Cache-Control": "private, max-age=3600",
             "Content-Length": str(size)
         }
