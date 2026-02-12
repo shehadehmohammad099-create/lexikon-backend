@@ -367,6 +367,7 @@ class ExplainWord(BaseModel):
     sentence: str
     speaker: str | None = ""
     work: str | None = ""
+    prompt_memory: Optional[str] = ""
 
 
 class ExplainPassage(BaseModel):
@@ -375,6 +376,7 @@ class ExplainPassage(BaseModel):
     speaker: Optional[str] = ""
     greek: str
     translation: Optional[str] = ""
+    prompt_memory: Optional[str] = ""
 
 
 class LinkWord(BaseModel):
@@ -391,6 +393,8 @@ class LinkWord(BaseModel):
 class ExplainLink(BaseModel):
     from_word: LinkWord = Field(..., alias="from")
     to_word: LinkWord = Field(..., alias="to")
+    link_note: Optional[str] = ""
+    prompt_memory: Optional[str] = ""
 
 
 class SaveAnnotation(BaseModel):
@@ -999,6 +1003,14 @@ def explain_word(req: ExplainWord, request: Request):
         remaining = None
         if not has_pro(pro):
             remaining = consume_free_ai_credit(request)
+        memory = (req.prompt_memory or "").strip()
+        memory_block = ""
+        if memory:
+            memory_block = f"""
+Student saved annotations (prompt memory):
+{memory}
+Use this as supporting context when helpful, but prioritize the source text and morphology.
+"""
 
         prompt = f"""
 You are a classical languages tutor. Give a concise, pointed coaching note (not an info dump).
@@ -1013,6 +1025,7 @@ Lemma: {req.lemma}
 POS: {req.pos}
 Morphology: {req.morph}
 Context word/phrase: {req.sentence}
+{memory_block}
 """
 
         r = openai.ChatCompletion.create(
@@ -1051,6 +1064,21 @@ def explain_link(req: ExplainLink, request: Request):
 
         a = req.from_word
         b = req.to_word
+        memory = (req.prompt_memory or "").strip()
+        link_note = (req.link_note or "").strip()
+        memory_block = ""
+        if memory:
+            memory_block = f"""
+Student saved annotations (prompt memory):
+{memory}
+Use this as supporting context when helpful, but prioritize the source text and morphology.
+"""
+        link_note_block = ""
+        if link_note:
+            link_note_block = f"""
+Student link note:
+{link_note}
+"""
 
         prompt = f"""
 You are a classical languages tutor. The student linked two words and wants a brief explanation of the link.
@@ -1072,6 +1100,8 @@ POS B: {b.pos}
 Morph B: {b.morph}
 Context B: {b.sentence}
 Work B: {b.work_title} {b.section_label}
+{link_note_block}
+{memory_block}
 """
 
         r = openai.ChatCompletion.create(
@@ -1107,6 +1137,14 @@ def explain_passage(req: ExplainPassage, request: Request):
         remaining = None
         if not has_pro(pro):
             remaining = consume_free_ai_credit(request)
+        memory = (req.prompt_memory or "").strip()
+        memory_block = ""
+        if memory:
+            memory_block = f"""
+Student saved annotations (prompt memory):
+{memory}
+Use this as supporting context when helpful, but prioritize the source text and syntax.
+"""
 
         prompt = f"""
 You are a classical languages tutor. Give a short, structured walkthrough to help a student read the passage (not a summary).
@@ -1125,6 +1163,7 @@ Greek text:
 
 Translation (for reference only):
 {req.translation}
+{memory_block}
 """
 
         r = openai.ChatCompletion.create(
