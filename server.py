@@ -403,6 +403,22 @@ class ExplainPassage(BaseModel):
     prompt_memory: Optional[str] = ""
 
 
+class WorkAnnotationSection(BaseModel):
+    id: Optional[str] = ""
+    label: Optional[str] = ""
+    text: str
+    translation: Optional[str] = ""
+
+
+class AnnotateWorkRequest(BaseModel):
+    work_id: Optional[str] = ""
+    work_title: str
+    author: Optional[str] = ""
+    meta: Optional[str] = ""
+    sections: List[WorkAnnotationSection] = []
+    prompt_memory: Optional[str] = ""
+
+
 class LinkWord(BaseModel):
     work_id: Optional[str] = ""
     work_title: Optional[str] = ""
@@ -502,6 +518,8 @@ class EmailCorpusRequest(BaseModel):
 # PODCAST HELPERS
 # -------------------------
 
+MAX_WORK_ANNOTATE_SECTIONS = 36
+MAX_WORK_ANNOTATE_SECTION_CHARS = 800
 MAX_PODCAST_SOURCE_CHARS = 30000
 
 
@@ -1366,6 +1384,104 @@ Translation (for reference only):
         raise e
     except Exception as e:
         print("AI ERROR (passage):", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/ai/annotate-work")
+def annotate_work(req: AnnotateWorkRequest, request: Request):
+    try:
+        pro = request.headers.get("X-Pro-Token")
+        remaining = None
+        if not has_pro(pro):
+            remaining = consume_free_ai_credit(request)
+
+        memory = (req.prompt_memory or "").strip()
+        memory_block = ""
+        if memory:
+            memory_block = f"""
+Student saved annotations (prompt memory):
+{memory}
+Use this as supporting context when helpful, but prioritize the source text.
+"""
+
+        normalized_sections = []
+        for sec in req.sections[:MAX_WORK_ANNOTATE_SECTIONS]:
+            text = (sec.text or "").strip()
+            if not text:
+                continue
+            normalized_sections.append({
+                "id": (sec.id or "").strip(),
+                "label": (sec.label or sec.id or "").strip(),
+                "text": text[:MAX_WORK_ANNOTATE_SECTION_CHARS],
+                "translation": (sec.translation or "").strip()[:MAX_WORK_ANNOTATE_SECTION_CHARS]
+            })
+
+        if not normalized_sections:
+            raise HTTPException(status_code=400, detail="sections required")
+
+        section_blocks = []
+        for sec in normalized_sections:
+            section_blocks.append(
+                f"""[{sec["label"] or sec["id"] or "section"}]
+Original:
+{sec["text"]}
+Translation:
+{sec["translation"]}"""
+            )
+        sections_text = "\n\n".join(section_blocks)
+
+        prompt = f"""
+You are a classical philologist and writing coach.
+Generate compact section-level annotations for a student reading this work.
+
+Output format:
+- Start with "Overview:" and write 3 bullets about the whole work's style/content profile.
+- Then write "Section notes:" and for each provided section write:
+  [section label]
+  - Style: one short bullet about stylistic/rhetorical feature(s)
+  - Content: one short bullet about conceptual/narrative point(s)
+  - Reading cue: one short bullet helping the student read that section
+
+Rules:
+- Keep each bullet under 24 words.
+- Be specific to the supplied text.
+- Do not invent citations or quote line numbers not provided.
+- Do not output JSON.
+
+Work title: {req.work_title}
+Author: {req.author}
+Meta: {req.meta}
+Sections provided: {len(normalized_sections)}
+
+{sections_text}
+{memory_block}
+"""
+
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a precise, concise classical philologist."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1200,
+        )
+
+        return {
+            "explanation": r.choices[0].message.content.strip(),
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS,
+            "sections_analyzed": len(normalized_sections),
+            "sections_total": len(req.sections)
+        }
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print("AI ERROR (annotate-work):", e)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
