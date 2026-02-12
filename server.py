@@ -277,13 +277,16 @@ def has_pro(pro_token: str | None) -> bool:
     if not customer_id:
         return False
 
-    subs = stripe.Subscription.list(
-        customer=customer_id,
-        status="active",
-        limit=1
-    )
-
-    return len(subs.data) > 0
+    try:
+        subs = stripe.Subscription.list(
+            customer=customer_id,
+            status="active",
+            limit=1
+        )
+        return len(subs.data) > 0
+    except Exception as e:
+        print(f"Stripe check failed in has_pro for customer {customer_id}: {e}")
+        return False
 
 
     return FRONTEND_URL
@@ -1541,6 +1544,77 @@ Sections provided: {len(normalized_sections)}
                         "token_id": token_id,
                         "note": note[:320]
                     })
+
+        if not annotations:
+            fallback_blocks = []
+            for sec in normalized_sections:
+                token_ids = [tok["id"] for tok in sec["tokens"][:24]]
+                if not token_ids:
+                    continue
+                fallback_blocks.append(
+                    f'SECTION {sec["id"]}\nTOKENS: {", ".join(token_ids)}\nTEXT: {sec["text"][:220]}'
+                )
+
+            if fallback_blocks:
+                fallback_prompt = f"""
+Produce token-linked annotations as plain lines.
+Format each line exactly:
+section_id|token_id|note
+
+Rules:
+- 1 line per section.
+- token_id must be from the TOKENS list for that section.
+- note max 24 words and about style/content reading cues.
+- No extra text before or after lines.
+
+{chr(10).join(fallback_blocks)}
+"""
+                try:
+                    rf = openai.ChatCompletion.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "You are a precise classical philologist."},
+                            {"role": "user", "content": fallback_prompt}
+                        ],
+                        temperature=0.1,
+                        max_tokens=500,
+                    )
+                    raw_lines = (rf.choices[0].message.content or "").strip().splitlines()
+                    for line in raw_lines:
+                        parts = [p.strip() for p in line.split("|", 2)]
+                        if len(parts) != 3:
+                            continue
+                        section_id, token_id, note = parts
+                        if not section_id or not token_id or not note:
+                            continue
+                        allowed = allowed_tokens_by_section.get(section_id) or set()
+                        if token_id not in allowed:
+                            continue
+                        annotations.append({
+                            "section_id": section_id,
+                            "token_id": token_id,
+                            "note": note[:320]
+                        })
+                except Exception as e:
+                    print("AI fallback annotate parse failed:", e)
+
+        if not annotations:
+            for sec in normalized_sections:
+                section_id = sec["id"]
+                first_token = next(
+                    (
+                        tok for tok in sec["tokens"]
+                        if re.search(r"[A-Za-z\u0370-\u03FF\u1F00-\u1FFF]", tok["text"])
+                    ),
+                    None
+                )
+                if not first_token:
+                    continue
+                annotations.append({
+                    "section_id": section_id,
+                    "token_id": first_token["id"],
+                    "note": "Track the section's governing claim and repeated diction; style cues reinforce the central content movement."
+                })
 
         if not overview:
             overview = ["AI auto-annotation generated."]
