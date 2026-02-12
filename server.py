@@ -200,6 +200,30 @@ def init_db():
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_saved_answers (
+          customer_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          prompt_type TEXT NOT NULL,
+          work_id TEXT,
+          work_title TEXT,
+          section_id TEXT,
+          section_label TEXT,
+          token_id TEXT,
+          token_text TEXT,
+          associated_text TEXT NOT NULL,
+          prompt_text TEXT,
+          answer_text TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (customer_id, id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS ai_saved_answers_customer_idx
+        ON ai_saved_answers (customer_id, created_at DESC)
+        """)
+
 init_db()
 
 
@@ -452,6 +476,26 @@ class EmailAnnotationsRequest(BaseModel):
     work_id: Optional[str] = ""
     work_title: Optional[str] = ""
     rows: List[AnnotationRow] = []
+
+
+class SaveAIAnswerRequest(BaseModel):
+    id: Optional[str] = ""
+    prompt_type: str
+    work_id: Optional[str] = ""
+    work_title: Optional[str] = ""
+    section_id: Optional[str] = ""
+    section_label: Optional[str] = ""
+    token_id: Optional[str] = ""
+    token_text: Optional[str] = ""
+    associated_text: str
+    prompt_text: Optional[str] = ""
+    answer_text: str
+
+
+class EmailCorpusRequest(BaseModel):
+    email: str
+    subject: Optional[str] = "Your Lexikon personal corpus"
+    markdown: str
 
 
 # -------------------------
@@ -717,6 +761,44 @@ def send_annotations_email(to_email: str, work_title: str, rows: List[Annotation
         raise HTTPException(status_code=502, detail="Email failed")
 
 
+def send_corpus_email(to_email: str, subject: str, markdown: str):
+    safe_subject = html_escape(subject or "Your Lexikon personal corpus")
+    safe_md = html_escape(markdown or "")
+    html = f"""
+        <p>Here is your exported Lexikon personal corpus.</p>
+        <pre style="white-space:pre-wrap;font-family:ui-monospace, SFMono-Regular, Menlo, monospace;line-height:1.45;border:1px solid #ddd;border-radius:8px;padding:12px;">{safe_md}</pre>
+        <p style="color:#666;font-size:12px;">Exported from Lexikon.</p>
+    """
+    text = markdown or ""
+
+    try:
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {os.environ['RESEND_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": "Lexikon <hello@the-lexicon-project.com>",
+                "to": to_email,
+                "subject": safe_subject,
+                "html": html,
+                "text": text,
+            },
+            timeout=8,
+        )
+
+        if response.ok:
+            print(f"✅ Corpus email sent to {to_email}")
+        else:
+            print(f"❌ Resend API error: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=502, detail="Email failed")
+
+    except Exception as e:
+        print(f"❌ Failed to send corpus email: {e}")
+        raise HTTPException(status_code=502, detail="Email failed")
+
+
 @app.post("/email/annotations")
 def email_annotations(payload: EmailAnnotationsRequest):
     email = (payload.email or "").strip().lower()
@@ -738,6 +820,28 @@ def email_annotations(payload: EmailAnnotationsRequest):
         )
 
     send_annotations_email(email, payload.work_title or "Annotations", payload.rows)
+    return {"ok": True}
+
+
+@app.post("/email/corpus")
+def email_corpus(payload: EmailCorpusRequest):
+    email = (payload.email or "").strip().lower()
+    markdown = (payload.markdown or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    if not markdown:
+        raise HTTPException(status_code=400, detail="Nothing to export")
+
+    with get_db() as cur:
+        cur.execute("""
+            INSERT INTO email_list (email, source, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (email) DO UPDATE
+            SET source = EXCLUDED.source,
+                updated_at = NOW()
+        """, (email, "export:corpus"))
+
+    send_corpus_email(email, payload.subject or "Your Lexikon personal corpus", markdown)
     return {"ok": True}
 
 
@@ -985,6 +1089,82 @@ def billing_restore_token(session_id: str):
 # -------------------------
 # AI ENDPOINTS
 # -------------------------
+
+@app.get("/ai/saved-answers")
+def list_saved_ai_answers(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"answers": []}
+
+    with get_db() as cur:
+        cur.execute("""
+        SELECT id, prompt_type, work_id, work_title, section_id, section_label,
+               token_id, token_text, associated_text, prompt_text, answer_text, created_at
+        FROM ai_saved_answers
+        WHERE customer_id = %s
+        ORDER BY created_at DESC
+        LIMIT 500
+        """, (customer_id,))
+        rows = cur.fetchall() or []
+        out = []
+        for r in rows:
+            item = dict(r)
+            if item.get("created_at"):
+                item["created_at"] = item["created_at"].isoformat()
+            out.append(item)
+        return {"answers": out}
+
+
+@app.post("/ai/saved-answers")
+def save_ai_answer(req: SaveAIAnswerRequest, request: Request):
+    customer_id = require_pro_user(request)
+    answer_text = (req.answer_text or "").strip()
+    associated_text = (req.associated_text or "").strip()
+    prompt_type = (req.prompt_type or "").strip().lower()
+    if not answer_text:
+        raise HTTPException(status_code=400, detail="answer_text required")
+    if not associated_text:
+        raise HTTPException(status_code=400, detail="associated_text required")
+    if not prompt_type:
+        raise HTTPException(status_code=400, detail="prompt_type required")
+
+    item_id = (req.id or "").strip() or secrets.token_urlsafe(12)
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO ai_saved_answers (
+          customer_id, id, prompt_type, work_id, work_title, section_id, section_label,
+          token_id, token_text, associated_text, prompt_text, answer_text
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (customer_id, id)
+        DO UPDATE SET
+          prompt_type = EXCLUDED.prompt_type,
+          work_id = EXCLUDED.work_id,
+          work_title = EXCLUDED.work_title,
+          section_id = EXCLUDED.section_id,
+          section_label = EXCLUDED.section_label,
+          token_id = EXCLUDED.token_id,
+          token_text = EXCLUDED.token_text,
+          associated_text = EXCLUDED.associated_text,
+          prompt_text = EXCLUDED.prompt_text,
+          answer_text = EXCLUDED.answer_text
+        """, (
+            customer_id,
+            item_id,
+            prompt_type,
+            req.work_id or None,
+            req.work_title or None,
+            req.section_id or None,
+            req.section_label or None,
+            req.token_id or None,
+            req.token_text or None,
+            associated_text,
+            req.prompt_text or None,
+            answer_text
+        ))
+
+    return {"ok": True, "id": item_id}
+
 
 @app.get("/ai/credits")
 def ai_credits(request: Request):
