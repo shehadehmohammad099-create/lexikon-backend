@@ -151,6 +151,24 @@ def init_db():
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS text_connections (
+          customer_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          from_word JSONB NOT NULL,
+          to_word JSONB NOT NULL,
+          link_note TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (customer_id, id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS text_connections_customer_idx
+        ON text_connections (customer_id, updated_at DESC)
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS restore_tokens (
           token TEXT PRIMARY KEY,
           customer_id TEXT NOT NULL,
@@ -469,6 +487,13 @@ class ExplainLink(BaseModel):
     to_word: LinkWord = Field(..., alias="to")
     link_note: Optional[str] = ""
     prompt_memory: Optional[str] = ""
+
+
+class SaveTextConnection(BaseModel):
+    id: Optional[str] = ""
+    from_word: LinkWord = Field(..., alias="from")
+    to_word: LinkWord = Field(..., alias="to")
+    link_note: Optional[str] = ""
 
 
 class SaveAnnotation(BaseModel):
@@ -2001,6 +2026,111 @@ def get_all_phrase_annotations(request: Request):
     except Exception as e:
         print(f"Error fetching all phrase annotations: {e}")
         return {"annotations": []}
+
+
+@app.post("/connections")
+def save_text_connection(req: SaveTextConnection, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    item_id = (req.id or "").strip() or secrets.token_urlsafe(12)
+    note = (req.link_note or "").strip()
+    from_payload = req.from_word.model_dump(by_alias=True)
+    to_payload = req.to_word.model_dump(by_alias=True)
+
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO text_connections (customer_id, id, from_word, to_word, link_note)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (customer_id, id)
+        DO UPDATE SET
+          from_word = EXCLUDED.from_word,
+          to_word = EXCLUDED.to_word,
+          link_note = EXCLUDED.link_note,
+          updated_at = NOW()
+        """, (
+            customer_id,
+            item_id,
+            Json(from_payload),
+            Json(to_payload),
+            note
+        ))
+    return {"ok": True, "id": item_id}
+
+
+@app.get("/connections/for-section")
+def get_connections_for_section(work_id: str, section_id: str, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"connections": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT id, from_word, to_word, link_note, created_at, updated_at
+            FROM text_connections
+            WHERE customer_id = %s
+            ORDER BY updated_at DESC
+            """, (customer_id,))
+            rows = cur.fetchall() or []
+
+        out = []
+        for r in rows:
+            f = r.get("from_word") or {}
+            t = r.get("to_word") or {}
+            if not (
+                (str(f.get("work_id") or "") == str(work_id) and str(f.get("section_id") or "") == str(section_id))
+                or (str(t.get("work_id") or "") == str(work_id) and str(t.get("section_id") or "") == str(section_id))
+            ):
+                continue
+            out.append({
+                "id": r.get("id"),
+                "from": f,
+                "to": t,
+                "link_note": r.get("link_note") or "",
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None
+            })
+        return {"connections": out}
+    except Exception as e:
+        print(f"Error fetching connections for section: {e}")
+        return {"connections": []}
+
+
+@app.get("/connections/all")
+def get_all_connections(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"connections": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT id, from_word, to_word, link_note, created_at, updated_at
+            FROM text_connections
+            WHERE customer_id = %s
+            ORDER BY updated_at DESC
+            """, (customer_id,))
+            rows = cur.fetchall() or []
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": r.get("id"),
+                "from": r.get("from_word") or {},
+                "to": r.get("to_word") or {},
+                "link_note": r.get("link_note") or "",
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None
+            })
+        return {"connections": out}
+    except Exception as e:
+        print(f"Error fetching all connections: {e}")
+        return {"connections": []}
 
 
 @app.get("/annotations")
