@@ -1254,6 +1254,21 @@ def save_ai_answer(req: SaveAIAnswerRequest, request: Request):
     return {"ok": True, "id": item_id}
 
 
+@app.delete("/ai/saved-answers/{answer_id}")
+def delete_saved_ai_answer(answer_id: str, request: Request):
+    customer_id = require_pro_user(request)
+    target_id = (answer_id or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="answer_id required")
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM ai_saved_answers
+        WHERE customer_id = %s AND id = %s
+        """, (customer_id, target_id))
+    return {"ok": True, "id": target_id}
+
+
 @app.get("/ai/credits")
 def ai_credits(request: Request):
     pro = request.headers.get("X-Pro-Token")
@@ -1916,6 +1931,21 @@ def get_podcast_audio(work_id: str, request: Request):
     )
 
 
+@app.delete("/podcasts/{work_id}")
+def delete_podcast(work_id: str, request: Request):
+    customer_id = require_pro_user(request)
+    target_id = (work_id or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="work_id required")
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM podcasts
+        WHERE customer_id = %s AND work_id = %s
+        """, (customer_id, target_id))
+    return {"ok": True, "work_id": target_id}
+
+
 @app.post("/podcasts/generate")
 def generate_podcast(req: PodcastGenerateRequest, request: Request):
     try:
@@ -2160,6 +2190,21 @@ def save_text_connection(req: SaveTextConnection, request: Request):
             note
         ))
     return {"ok": True, "id": item_id}
+
+
+@app.delete("/connections/{connection_id}")
+def delete_text_connection(connection_id: str, request: Request):
+    customer_id = require_pro_user(request)
+    target_id = (connection_id or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="connection_id required")
+
+    with get_db() as cur:
+        cur.execute("""
+        DELETE FROM text_connections
+        WHERE customer_id = %s AND id = %s
+        """, (customer_id, target_id))
+    return {"ok": True, "id": target_id}
 
 
 @app.get("/connections/for-section")
