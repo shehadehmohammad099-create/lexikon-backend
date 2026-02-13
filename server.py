@@ -588,6 +588,8 @@ class EmailCorpusRequest(BaseModel):
 
 MAX_WORK_ANNOTATE_SECTIONS = 36
 MAX_WORK_ANNOTATE_SECTION_CHARS = 800
+MIN_WORK_ANNOTATIONS = 5
+MAX_WORK_ANNOTATIONS = 8
 MAX_PODCAST_SOURCE_CHARS = 30000
 
 
@@ -1505,7 +1507,9 @@ Use this as supporting context when helpful, but prioritize the source text.
             raise HTTPException(status_code=400, detail="sections required")
 
         section_blocks = []
+        section_order = {}
         for sec in normalized_sections:
+            section_order[sec["id"]] = len(section_order)
             token_lines = "\n".join([
                 f'- {tok["id"]}: {tok["text"]}'
                 for tok in sec["tokens"]
@@ -1541,7 +1545,9 @@ Output format:
   }}
 
 Rules:
-- 1-2 annotations per section; max 2.
+- Return {MIN_WORK_ANNOTATIONS}-{MAX_WORK_ANNOTATIONS} annotations total (if enough valid sections/tokens exist).
+- Prioritize only the strongest, highest-signal observations.
+- Prefer at most 1 annotation per section unless an additional note is clearly exceptional.
 - Each note under 28 words.
 - Notes should mention style and/or content insight useful for reading.
 - Use only provided section_id/token_id values.
@@ -1580,6 +1586,46 @@ Sections provided: {len(normalized_sections)}
 
         overview = []
         annotations = []
+        def score_annotation_note(note: str) -> int:
+            words = re.findall(r"[A-Za-z\u0370-\u03FF\u1F00-\u1FFF']+", note.lower())
+            unique_words = {w for w in words if len(w) >= 4}
+            signal_keywords = (
+                "diction", "syntax", "imagery", "tone", "rhythm", "register",
+                "voice", "motif", "contrast", "structure", "argument", "framing"
+            )
+            keyword_hits = sum(1 for k in signal_keywords if k in note.lower())
+            word_count = len(note.split())
+            length_score = 2 if 8 <= word_count <= 24 else 1
+            return (keyword_hits * 3) + min(len(unique_words), 6) + length_score
+
+        def trim_annotations(rows: List[dict]) -> List[dict]:
+            if not rows:
+                return []
+            deduped = []
+            seen = set()
+            for item in rows:
+                key = (
+                    str(item.get("section_id") or "").strip(),
+                    str(item.get("token_id") or "").strip(),
+                    str(item.get("note") or "").strip().lower(),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+            if len(deduped) <= MAX_WORK_ANNOTATIONS:
+                return deduped
+            ranked = []
+            for idx, item in enumerate(deduped):
+                ranked.append((
+                    score_annotation_note(str(item.get("note") or "")),
+                    -section_order.get(str(item.get("section_id") or ""), 10_000),
+                    -idx,
+                    item
+                ))
+            ranked.sort(reverse=True)
+            return [x[3] for x in ranked[:MAX_WORK_ANNOTATIONS]]
+
         if isinstance(parsed, dict):
             ov = parsed.get("overview")
             if isinstance(ov, list):
@@ -1621,7 +1667,9 @@ Format each line exactly:
 section_id|token_id|note
 
 Rules:
-- 1 line per section.
+- Return {MIN_WORK_ANNOTATIONS}-{MAX_WORK_ANNOTATIONS} lines total (or fewer only if fewer valid sections/tokens exist).
+- Focus on strongest reading cues, not exhaustive coverage.
+- Prefer at most 1 line per section.
 - token_id must be from the TOKENS list for that section.
 - note max 24 words and about style/content reading cues.
 - No extra text before or after lines.
@@ -1658,7 +1706,10 @@ Rules:
                     print("AI fallback annotate parse failed:", e)
 
         if not annotations:
-            for sec in normalized_sections:
+            fallback_sections = [sec for sec in normalized_sections if sec["tokens"]]
+            fallback_limit = min(MAX_WORK_ANNOTATIONS, max(1, len(fallback_sections)))
+            selected_sections = fallback_sections[:fallback_limit]
+            for sec in selected_sections:
                 section_id = sec["id"]
                 first_token = next(
                     (
@@ -1674,6 +1725,8 @@ Rules:
                     "token_id": first_token["id"],
                     "note": "Track the section's governing claim and repeated diction; style cues reinforce the central content movement."
                 })
+
+        annotations = trim_annotations(annotations)
 
         if not overview:
             overview = ["AI auto-annotation generated."]
