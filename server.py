@@ -126,6 +126,31 @@ def init_db():
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS phrase_annotations (
+          customer_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          work_id TEXT NOT NULL,
+          section_id TEXT NOT NULL,
+          token_ids JSONB NOT NULL DEFAULT '[]',
+          phrase_text TEXT NOT NULL DEFAULT '',
+          meaning_text TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          PRIMARY KEY (customer_id, id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS phrase_annotations_customer_idx
+        ON phrase_annotations (customer_id, updated_at DESC)
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS phrase_annotations_work_section_idx
+        ON phrase_annotations (customer_id, work_id, section_id)
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS restore_tokens (
           token TEXT PRIMARY KEY,
           customer_id TEXT NOT NULL,
@@ -452,6 +477,15 @@ class SaveAnnotation(BaseModel):
     token_id: Optional[str] = None
     content: str
     visibility: Optional[str] = "private"
+
+
+class SavePhraseAnnotation(BaseModel):
+    id: Optional[str] = ""
+    work_id: str
+    section_id: str
+    token_ids: List[str] = []
+    phrase_text: Optional[str] = ""
+    meaning_text: str
 
 
 class Flashcard(BaseModel):
@@ -1850,6 +1884,123 @@ def save_annotation(req: SaveAnnotation, request: Request):
         """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, visibility))
 
     return {"ok": True}
+
+
+@app.post("/annotations/phrase")
+def save_phrase_annotation(req: SavePhraseAnnotation, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    item_id = (req.id or "").strip() or secrets.token_urlsafe(12)
+    meaning = (req.meaning_text or "").strip()
+
+    with get_db() as cur:
+        if not meaning:
+            cur.execute("""
+            DELETE FROM phrase_annotations
+            WHERE customer_id = %s
+              AND id = %s
+            """, (customer_id, item_id))
+            return {"deleted": True, "id": item_id}
+
+        token_ids = [str(t).strip() for t in (req.token_ids or []) if str(t).strip()]
+        cur.execute("""
+        INSERT INTO phrase_annotations (
+          customer_id, id, work_id, section_id, token_ids, phrase_text, meaning_text
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (customer_id, id)
+        DO UPDATE SET
+          work_id = EXCLUDED.work_id,
+          section_id = EXCLUDED.section_id,
+          token_ids = EXCLUDED.token_ids,
+          phrase_text = EXCLUDED.phrase_text,
+          meaning_text = EXCLUDED.meaning_text,
+          updated_at = NOW()
+        """, (
+            customer_id,
+            item_id,
+            req.work_id,
+            req.section_id,
+            Json(token_ids),
+            (req.phrase_text or "").strip(),
+            meaning
+        ))
+
+    return {"ok": True, "id": item_id}
+
+
+@app.get("/annotations/phrase")
+def get_phrase_annotations(work_id: str, section_id: str, request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"annotations": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT id, work_id, section_id, token_ids, phrase_text, meaning_text, created_at, updated_at
+            FROM phrase_annotations
+            WHERE customer_id = %s
+              AND work_id = %s
+              AND section_id = %s
+            ORDER BY updated_at DESC
+            """, (customer_id, work_id, section_id))
+            rows = cur.fetchall() or []
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "work_id": r["work_id"],
+                "section_id": r["section_id"],
+                "token_ids": list(r.get("token_ids") or []),
+                "phrase_text": r.get("phrase_text") or "",
+                "meaning_text": r.get("meaning_text") or "",
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None
+            })
+        return {"annotations": out}
+    except Exception as e:
+        print(f"Error fetching phrase annotations: {e}")
+        return {"annotations": []}
+
+
+@app.get("/annotations/phrase/all")
+def get_all_phrase_annotations(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"annotations": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT id, work_id, section_id, token_ids, phrase_text, meaning_text, created_at, updated_at
+            FROM phrase_annotations
+            WHERE customer_id = %s
+            ORDER BY updated_at DESC
+            """, (customer_id,))
+            rows = cur.fetchall() or []
+
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "work_id": r["work_id"],
+                "section_id": r["section_id"],
+                "token_ids": list(r.get("token_ids") or []),
+                "phrase_text": r.get("phrase_text") or "",
+                "meaning_text": r.get("meaning_text") or "",
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                "updated_at": r.get("updated_at").isoformat() if r.get("updated_at") else None
+            })
+        return {"annotations": out}
+    except Exception as e:
+        print(f"Error fetching all phrase annotations: {e}")
+        return {"annotations": []}
 
 
 @app.get("/annotations")
