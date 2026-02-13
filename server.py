@@ -3,7 +3,7 @@ import secrets
 import stripe
 import openai
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -1707,6 +1707,55 @@ Rules:
 # -------------------------
 # PODCAST ENDPOINTS
 # -------------------------
+
+@app.get("/podcasts/all")
+def get_all_podcasts(request: Request):
+    pro = request.headers.get("X-Pro-Token")
+    customer_id = customer_from_token(pro)
+    if not customer_id:
+        return {"podcasts": []}
+
+    try:
+        with get_db() as cur:
+            cur.execute("""
+            SELECT work_id, work_title, audio_mime, voice, model, created_at, updated_at
+            FROM podcasts
+            WHERE customer_id = %s
+            ORDER BY updated_at DESC
+            """, (customer_id,))
+            rows = cur.fetchall() or []
+
+        base_url = str(request.base_url).rstrip("/")
+        out = []
+        for row in rows:
+            raw_work_id = str(row.get("work_id") or "")
+            work_id_for_url = quote(raw_work_id, safe="")
+            parent_work_id = raw_work_id
+            section_id = ""
+            is_section = False
+            if "::section::" in raw_work_id:
+                left, right = raw_work_id.split("::section::", 1)
+                parent_work_id = left
+                section_id = right
+                is_section = True
+            out.append({
+                "work_id": raw_work_id,
+                "parent_work_id": parent_work_id,
+                "section_id": section_id,
+                "is_section": is_section,
+                "work_title": row.get("work_title") or "",
+                "audio_url": f"{base_url}/podcasts/{work_id_for_url}/audio",
+                "audio_mime": row.get("audio_mime") or "audio/mpeg",
+                "voice": row.get("voice") or "",
+                "model": row.get("model") or "",
+                "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+                "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None
+            })
+        return {"podcasts": out}
+    except Exception as e:
+        print(f"Error fetching all podcasts: {e}")
+        return {"podcasts": []}
+
 
 @app.get("/podcasts/{work_id}")
 def get_podcast_meta(work_id: str, request: Request):
