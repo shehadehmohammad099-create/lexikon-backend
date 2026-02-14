@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.responses import Response
 from fastapi.responses import JSONResponse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from fastapi import Body
@@ -219,10 +219,51 @@ def init_db():
           audio_mime TEXT NOT NULL DEFAULT 'audio/mpeg',
           voice TEXT NOT NULL DEFAULT 'alloy',
           model TEXT NOT NULL DEFAULT 'tts-1',
+          transcript_segments JSONB NOT NULL DEFAULT '[]',
+          chapters JSONB NOT NULL DEFAULT '[]',
           created_at TIMESTAMPTZ DEFAULT NOW(),
           updated_at TIMESTAMPTZ DEFAULT NOW(),
           PRIMARY KEY (customer_id, work_id)
         )
+        """)
+
+        cur.execute("""
+        ALTER TABLE podcasts
+        ADD COLUMN IF NOT EXISTS transcript_segments JSONB NOT NULL DEFAULT '[]'
+        """)
+
+        cur.execute("""
+        ALTER TABLE podcasts
+        ADD COLUMN IF NOT EXISTS chapters JSONB NOT NULL DEFAULT '[]'
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS podcast_preferences (
+          customer_id TEXT PRIMARY KEY,
+          target_minutes INT NOT NULL DEFAULT 10,
+          tone TEXT NOT NULL DEFAULT 'conversational',
+          depth TEXT NOT NULL DEFAULT 'balanced',
+          voice_a TEXT NOT NULL DEFAULT 'alloy',
+          voice_b TEXT NOT NULL DEFAULT 'nova',
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS podcast_feedback (
+          id SERIAL PRIMARY KEY,
+          customer_id TEXT NOT NULL,
+          work_id TEXT NOT NULL,
+          feedback_key TEXT NOT NULL,
+          note TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS podcast_feedback_customer_idx
+        ON podcast_feedback (customer_id, created_at DESC)
         """)
 
         cur.execute("""
@@ -474,7 +515,9 @@ class AnnotateWorkRequest(BaseModel):
 class LinkWord(BaseModel):
     work_id: Optional[str] = ""
     work_title: Optional[str] = ""
+    section_id: Optional[str] = ""
     section_label: Optional[str] = ""
+    token_id: Optional[str] = ""
     token: str
     lemma: Optional[str] = ""
     pos: Optional[str] = ""
@@ -546,6 +589,23 @@ class PodcastGenerateRequest(BaseModel):
     sections: List[dict] = []
     target_minutes: Optional[int] = 10
     voices: Optional[List[str]] = ["alloy", "nova"]
+    tone: Optional[str] = "conversational"
+    depth: Optional[str] = "balanced"
+    learner_context: Optional[List[dict]] = []
+
+
+class SavePodcastPreferencesRequest(BaseModel):
+    target_minutes: Optional[int] = 10
+    tone: Optional[str] = "conversational"
+    depth: Optional[str] = "balanced"
+    voice_a: Optional[str] = "alloy"
+    voice_b: Optional[str] = "nova"
+
+
+class SavePodcastFeedbackRequest(BaseModel):
+    work_id: str
+    feedback_key: str
+    note: Optional[str] = ""
 
 
 class AnnotationRow(BaseModel):
@@ -591,6 +651,8 @@ MAX_WORK_ANNOTATE_SECTION_CHARS = 800
 MIN_WORK_ANNOTATIONS = 5
 MAX_WORK_ANNOTATIONS = 8
 MAX_PODCAST_SOURCE_CHARS = 30000
+MIN_PODCAST_MINUTES = 4
+MAX_PODCAST_MINUTES = 25
 
 
 def build_podcast_source_text(sections: List[dict]) -> str:
@@ -613,16 +675,112 @@ def build_podcast_source_text(sections: List[dict]) -> str:
     return "".join(parts).strip()
 
 
+def normalize_podcast_minutes(value: Optional[int]) -> int:
+    minutes = value or 10
+    return max(MIN_PODCAST_MINUTES, min(MAX_PODCAST_MINUTES, int(minutes)))
+
+
+def normalize_podcast_tone(value: str | None) -> str:
+    tone = (value or "conversational").strip().lower()
+    allowed = {"conversational", "dramatic", "scholarly"}
+    return tone if tone in allowed else "conversational"
+
+
+def normalize_podcast_depth(value: str | None) -> str:
+    depth = (value or "balanced").strip().lower()
+    allowed = {"intro", "balanced", "advanced"}
+    return depth if depth in allowed else "balanced"
+
+
+def build_learner_context_text(context_rows: Optional[List[dict]]) -> str:
+    rows = context_rows or []
+    out = []
+    for row in rows[:10]:
+        token = str(row.get("token") or "").strip()
+        lemma = str(row.get("lemma") or "").strip()
+        note = str(row.get("note") or row.get("body") or "").strip()
+        if not token and not note:
+            continue
+        bit = f"token={token}" if token else "token=unknown"
+        if lemma:
+            bit += f", lemma={lemma}"
+        if note:
+            bit += f", note={note[:220]}"
+        out.append(f"- {bit}")
+    return "\n".join(out) if out else "- none provided"
+
+
+def estimate_speech_seconds(text: str) -> float:
+    words = max(1, len(re.findall(r"\w+", text or "")))
+    # ~2.6 w/s for clear educational narration.
+    return max(2.0, words / 2.6)
+
+
+def build_podcast_chapters(sections: List[dict], total_seconds: float) -> List[dict]:
+    cleaned = []
+    for sec in sections or []:
+        label = str(sec.get("label") or sec.get("id") or "").strip()
+        text = str(sec.get("text") or "").strip()
+        if not text:
+            continue
+        cleaned.append({
+            "label": label or "Section",
+            "weight": max(1, len(text))
+        })
+
+    if not cleaned:
+        return [{"label": "Episode", "start_seconds": 0}]
+
+    total_weight = sum(c["weight"] for c in cleaned) or 1
+    t = 0.0
+    chapters = []
+    for row in cleaned:
+        chapters.append({
+            "label": row["label"],
+            "start_seconds": int(round(t))
+        })
+        t += (row["weight"] / total_weight) * max(total_seconds, 1)
+    return chapters
+
+
 def generate_podcast_script(req: PodcastGenerateRequest, source_text: str) -> str:
-    """Generate a two-host podcast script from source text using OpenAI."""
+    """Generate a two-host podcast script with a natural spoken rhythm."""
+    target_minutes = normalize_podcast_minutes(req.target_minutes)
+    tone = normalize_podcast_tone(req.tone)
+    depth = normalize_podcast_depth(req.depth)
+    learner_context = build_learner_context_text(req.learner_context)
+    section_labels = [
+        str(sec.get("label") or sec.get("id") or "").strip()
+        for sec in (req.sections or [])
+        if (sec.get("text") or "").strip()
+    ]
+    section_list = ", ".join([s for s in section_labels if s][:12]) or "none"
     prompt = f"""
-You are creating a polished, listenable podcast episode for students of classical texts.
-Write a dialogue between two hosts. Use explicit speaker tags at the start of each line,
-exactly as "HOST A:" or "HOST B:" (all caps). No bullet points.
-Aim for ~{req.target_minutes} minutes (roughly 1200-1600 words).
-Focus on: context, key themes, character arcs, and 2–3 close-reading moments.
-Avoid quoting long passages; keep quotes very short.
-If the source is partial, be transparent and avoid over-claiming.
+Create a natural-sounding educational podcast dialogue between two hosts.
+Use explicit speaker tags at the start of each line, exactly "HOST A:" or "HOST B:".
+No bullet points. Keep turn lengths varied. Include occasional short interruptions and callbacks.
+Never fabricate details beyond the source excerpt.
+
+Episode settings:
+- target minutes: {target_minutes}
+- tone: {tone}
+- depth: {depth}
+- likely section labels: {section_list}
+
+Required episode structure:
+1) Hook (first ~30 seconds)
+2) Historical/literary context
+3) 2-3 close-reading moments with VERY short quotes and immediate paraphrase
+4) Concise takeaway + "what to read next"
+
+Style constraints:
+- Sound spoken, not essay-like.
+- Reference section labels naturally when relevant.
+- If source is partial, explicitly say so.
+- Keep quotes very short.
+
+Learner context (prior struggles/notes):
+{learner_context}
 
 Work: {req.title}
 Author: {req.author}
@@ -638,8 +796,8 @@ Source excerpt:
             {"role": "system", "content": "You are a classical philologist and podcast writer."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.4,
-        max_tokens=1800,
+        temperature=0.65,
+        max_tokens=2200,
     )
 
     return r.choices[0].message.content.strip()
@@ -704,11 +862,20 @@ def split_dialogue(script: str) -> List[dict]:
             current_text = f"{current_text} {line}".strip() if current_text else line
     if current_text and current_speaker:
         segments.append({"speaker": current_speaker, "text": current_text.strip()})
-    return segments
+    if not segments:
+        return []
+
+    merged = []
+    for seg in segments:
+        if merged and merged[-1]["speaker"] == seg["speaker"]:
+            merged[-1]["text"] = f'{merged[-1]["text"]} {seg["text"]}'.strip()
+        else:
+            merged.append(seg)
+    return merged
 
 
 def generate_podcast_audio(script: str, voice: str = "alloy", model: str = "tts-1", voices: Optional[List[str]] = None):
-    """Generate TTS audio bytes for a script, alternating voices by speaker."""
+    """Generate TTS audio bytes and estimated transcript timings."""
     url = "https://api.openai.com/v1/audio/speech"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -724,24 +891,47 @@ def generate_podcast_audio(script: str, voice: str = "alloy", model: str = "tts-
         segments = [{"speaker": "A", "text": script}]
 
     audio_parts = []
+    transcript_segments: List[Dict[str, Any]] = []
     part_idx = 0
+    cursor_seconds = 0.0
     for seg in segments:
         chosen_voice = voice_a if seg["speaker"] == "A" else voice_b
         chunks = split_text_for_tts(seg["text"], max_chars=3800)
+        seg_start = cursor_seconds
+        seg_duration = 0.0
         for chunk in chunks:
             part_idx += 1
+            safe_chunk = chunk.strip()
+            if safe_chunk and safe_chunk[-1] not in ".!?":
+                safe_chunk = f"{safe_chunk}."
             payload = {
                 "model": model,
                 "voice": chosen_voice,
-                "input": chunk,
+                "input": safe_chunk,
                 "response_format": "mp3"
             }
             res = requests.post(url, headers=headers, json=payload, timeout=60)
             if not res.ok:
                 raise HTTPException(status_code=500, detail=f"TTS failed (part {part_idx}): {res.text}")
             audio_parts.append(res.content)
+            chunk_seconds = estimate_speech_seconds(safe_chunk)
+            seg_duration += chunk_seconds
+            cursor_seconds += chunk_seconds
 
-    return b"".join(audio_parts), "audio/mpeg", ",".join([voice_a, voice_b]), model
+        transcript_segments.append({
+            "speaker": seg["speaker"],
+            "text": seg["text"],
+            "start_seconds": round(seg_start, 2),
+            "end_seconds": round(seg_start + seg_duration, 2)
+        })
+
+    return (
+        b"".join(audio_parts),
+        "audio/mpeg",
+        ",".join([voice_a, voice_b]),
+        model,
+        transcript_segments
+    )
 
 
 # -------------------------
@@ -1776,6 +1966,83 @@ Rules:
 # PODCAST ENDPOINTS
 # -------------------------
 
+def get_podcast_preferences_row(customer_id: str) -> Dict[str, Any]:
+    with get_db() as cur:
+        cur.execute("""
+        SELECT target_minutes, tone, depth, voice_a, voice_b, updated_at
+        FROM podcast_preferences
+        WHERE customer_id = %s
+        """, (customer_id,))
+        row = cur.fetchone()
+
+    if not row:
+        return {
+            "target_minutes": 10,
+            "tone": "conversational",
+            "depth": "balanced",
+            "voice_a": "alloy",
+            "voice_b": "nova",
+            "updated_at": None
+        }
+
+    return {
+        "target_minutes": normalize_podcast_minutes(row.get("target_minutes")),
+        "tone": normalize_podcast_tone(row.get("tone")),
+        "depth": normalize_podcast_depth(row.get("depth")),
+        "voice_a": row.get("voice_a") or "alloy",
+        "voice_b": row.get("voice_b") or "nova",
+        "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None
+    }
+
+
+@app.get("/podcasts/preferences")
+def get_podcast_preferences(request: Request):
+    customer_id = require_pro_user(request)
+    return {"ok": True, "preferences": get_podcast_preferences_row(customer_id)}
+
+
+@app.post("/podcasts/preferences")
+def save_podcast_preferences(req: SavePodcastPreferencesRequest, request: Request):
+    customer_id = require_pro_user(request)
+    minutes = normalize_podcast_minutes(req.target_minutes)
+    tone = normalize_podcast_tone(req.tone)
+    depth = normalize_podcast_depth(req.depth)
+    voice_a = (req.voice_a or "alloy").strip() or "alloy"
+    voice_b = (req.voice_b or "nova").strip() or "nova"
+
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO podcast_preferences (customer_id, target_minutes, tone, depth, voice_a, voice_b)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (customer_id) DO UPDATE SET
+          target_minutes = EXCLUDED.target_minutes,
+          tone = EXCLUDED.tone,
+          depth = EXCLUDED.depth,
+          voice_a = EXCLUDED.voice_a,
+          voice_b = EXCLUDED.voice_b,
+          updated_at = NOW()
+        """, (customer_id, minutes, tone, depth, voice_a, voice_b))
+
+    return {"ok": True, "preferences": get_podcast_preferences_row(customer_id)}
+
+
+@app.post("/podcasts/feedback")
+def save_podcast_feedback(req: SavePodcastFeedbackRequest, request: Request):
+    customer_id = require_pro_user(request)
+    key = (req.feedback_key or "").strip().lower()
+    allowed = {"too_basic", "too_dense", "too_long", "voice_mismatch", "great"}
+    if key not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid feedback key")
+
+    with get_db() as cur:
+        cur.execute("""
+        INSERT INTO podcast_feedback (customer_id, work_id, feedback_key, note)
+        VALUES (%s, %s, %s, %s)
+        """, (customer_id, req.work_id, key, (req.note or "")[:500]))
+
+    return {"ok": True}
+
+
 @app.get("/podcasts/all")
 def get_all_podcasts(request: Request):
     pro = request.headers.get("X-Pro-Token")
@@ -1786,7 +2053,7 @@ def get_all_podcasts(request: Request):
     try:
         with get_db() as cur:
             cur.execute("""
-            SELECT work_id, work_title, audio_mime, voice, model, created_at, updated_at
+            SELECT work_id, work_title, audio_mime, voice, model, chapters, created_at, updated_at
             FROM podcasts
             WHERE customer_id = %s
             ORDER BY updated_at DESC
@@ -1816,6 +2083,7 @@ def get_all_podcasts(request: Request):
                 "audio_mime": row.get("audio_mime") or "audio/mpeg",
                 "voice": row.get("voice") or "",
                 "model": row.get("model") or "",
+                "chapters": row.get("chapters") or [],
                 "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
                 "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None
             })
@@ -1830,7 +2098,7 @@ def get_podcast_meta(work_id: str, request: Request):
     customer_id = require_pro_user(request)
     with get_db() as cur:
         cur.execute("""
-        SELECT work_id, created_at, updated_at, audio_mime
+        SELECT work_id, created_at, updated_at, audio_mime, transcript_segments, chapters, voice, model
         FROM podcasts
         WHERE customer_id = %s AND work_id = %s
         """, (customer_id, work_id))
@@ -1846,6 +2114,10 @@ def get_podcast_meta(work_id: str, request: Request):
         "work_id": work_id,
         "audio_url": audio_url,
         "audio_mime": row.get("audio_mime"),
+        "transcript_segments": row.get("transcript_segments") or [],
+        "chapters": row.get("chapters") or [],
+        "voice": row.get("voice") or "",
+        "model": row.get("model") or "",
         "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
         "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None
     }
@@ -1957,6 +2229,13 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
             print("⚠️ No sections provided")
             raise HTTPException(status_code=400, detail="No sections provided")
 
+        prefs = get_podcast_preferences_row(customer_id)
+        req.target_minutes = normalize_podcast_minutes(req.target_minutes or prefs.get("target_minutes"))
+        req.tone = normalize_podcast_tone(req.tone or prefs.get("tone"))
+        req.depth = normalize_podcast_depth(req.depth or prefs.get("depth"))
+        if not req.voices:
+            req.voices = [prefs.get("voice_a") or "alloy", prefs.get("voice_b") or "nova"]
+
         source_text = build_podcast_source_text(req.sections)
         print(f"🎙️ source chars={len(source_text)} sections={len(req.sections)}")
         if not source_text:
@@ -1968,17 +2247,21 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
         print(f"🎙️ script length={len(script)}")
 
         print("🎙️ generating audio…")
-        audio_bytes, audio_mime, voice, model = generate_podcast_audio(
+        audio_bytes, audio_mime, voice, model, transcript_segments = generate_podcast_audio(
             script,
             voices=req.voices or ["alloy", "nova"]
         )
+        total_seconds = 0.0
+        if transcript_segments:
+            total_seconds = max(float(transcript_segments[-1].get("end_seconds") or 0), 1.0)
+        chapters = build_podcast_chapters(req.sections, total_seconds)
         print(f"🎙️ audio bytes={len(audio_bytes)} mime={audio_mime} voice={voice} model={model}")
 
         with get_db() as cur:
             print("🎙️ writing to DB…")
             cur.execute("""
-            INSERT INTO podcasts (customer_id, work_id, work_title, script, audio, audio_mime, voice, model)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO podcasts (customer_id, work_id, work_title, script, audio, audio_mime, voice, model, transcript_segments, chapters)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (customer_id, work_id) DO UPDATE SET
               work_title = EXCLUDED.work_title,
               script = EXCLUDED.script,
@@ -1986,8 +2269,21 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
               audio_mime = EXCLUDED.audio_mime,
               voice = EXCLUDED.voice,
               model = EXCLUDED.model,
+              transcript_segments = EXCLUDED.transcript_segments,
+              chapters = EXCLUDED.chapters,
               updated_at = NOW()
-            """, (customer_id, req.work_id, req.title, script, psycopg2.Binary(audio_bytes), audio_mime, voice, model))
+            """, (
+                customer_id,
+                req.work_id,
+                req.title,
+                script,
+                psycopg2.Binary(audio_bytes),
+                audio_mime,
+                voice,
+                model,
+                Json(transcript_segments),
+                Json(chapters)
+            ))
 
         base_url = str(request.base_url).rstrip("/")
         audio_url = f"{base_url}/podcasts/{req.work_id}/audio"
@@ -1996,6 +2292,10 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
             "ok": True,
             "work_id": req.work_id,
             "audio_url": audio_url,
+            "transcript_segments": transcript_segments,
+            "chapters": chapters,
+            "voice": voice,
+            "model": model,
             "updated_at": datetime.utcnow().isoformat()
         }
     except HTTPException as e:
