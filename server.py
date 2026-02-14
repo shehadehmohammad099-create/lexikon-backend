@@ -743,11 +743,33 @@ def build_podcast_chapters(sections: List[dict], total_seconds: float) -> List[d
     return chapters
 
 
+def count_script_words(text: str) -> int:
+    return len(re.findall(r"[A-Za-z\u0370-\u03FF\u1F00-\u1FFF0-9']+", text or ""))
+
+
+def sanitize_podcast_script(script: str) -> str:
+    lines = []
+    last_speaker = "A"
+    for raw in (script or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("HOST A:") or line.startswith("HOST B:"):
+            lines.append(line)
+            last_speaker = "A" if line.startswith("HOST A:") else "B"
+            continue
+        # Keep lines parseable for downstream speaker splitting.
+        lines.append(f"HOST {last_speaker}: {line}")
+    return "\n".join(lines).strip()
+
+
 def generate_podcast_script(req: PodcastGenerateRequest, source_text: str) -> str:
     """Generate a two-host podcast script with a natural spoken rhythm."""
     target_minutes = normalize_podcast_minutes(req.target_minutes)
     tone = normalize_podcast_tone(req.tone)
     depth = normalize_podcast_depth(req.depth)
+    min_words = int(target_minutes * 125)
+    target_words = int(target_minutes * 145)
     learner_context = build_learner_context_text(req.learner_context)
     section_labels = [
         str(sec.get("label") or sec.get("id") or "").strip()
@@ -778,6 +800,7 @@ Style constraints:
 - Reference section labels naturally when relevant.
 - If source is partial, explicitly say so.
 - Keep quotes very short.
+- Target roughly {target_words} words. Do not go below {min_words} words.
 
 Learner context (prior struggles/notes):
 {learner_context}
@@ -797,10 +820,36 @@ Source excerpt:
             {"role": "user", "content": prompt}
         ],
         temperature=0.65,
-        max_tokens=2200,
+        max_tokens=min(4200, max(2400, target_minutes * 220)),
     )
 
-    return r.choices[0].message.content.strip()
+    script = sanitize_podcast_script(r.choices[0].message.content.strip())
+    words = count_script_words(script)
+    if words >= min_words:
+        return script
+
+    deficit = max(180, min_words - words)
+    expand_prompt = f"""
+Continue this exact episode in the same voice and structure.
+Write only new dialogue lines, each starting with HOST A: or HOST B:.
+Do not repeat previous points. Add the missing depth and examples.
+Add about {deficit} more words.
+
+Existing script:
+{script}
+"""
+    r2 = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a classical philologist and podcast writer."},
+            {"role": "user", "content": expand_prompt}
+        ],
+        temperature=0.55,
+        max_tokens=min(2400, max(900, deficit * 2)),
+    )
+    continuation = sanitize_podcast_script(r2.choices[0].message.content.strip())
+    joined = f"{script}\n{continuation}".strip()
+    return sanitize_podcast_script(joined)
 
 
 def split_text_for_tts(text: str, max_chars: int = 3800) -> List[str]:
