@@ -1543,10 +1543,23 @@ def memorize_judge(req: MemorizeJudgeRequest, request: Request):
             remaining = consume_free_ai_credit(request)
 
         prompt = f"""
-You are grading a memorisation exercise.
-Compare the expected sentence and the student's answer by meaning.
-Accept close paraphrases and minor wording, punctuation, or inflection differences.
-Reject if key meaning changes, key facts/entities are missing, or polarity changes.
+You are grading a memorisation exercise with a lenient policy.
+Primary goal: reward meaning-level recall, not exact wording.
+
+Mark as CORRECT when the student's answer keeps the same core meaning, even if:
+- wording is different (paraphrase/synonyms)
+- clauses are reordered
+- tense/case/inflection/article/pronoun choices differ
+- minor details are omitted but the central proposition is intact
+- punctuation/spelling is imperfect
+
+Mark as INCORRECT only when there is a substantive meaning error, such as:
+- opposite/contradictory polarity
+- wrong subject/object or swapped agent/patient
+- different event or fabricated key claim
+- omission of a detail that changes the core meaning
+
+If borderline or uncertain, prefer CORRECT.
 
 Mode: {mode}
 Expected:
@@ -1558,6 +1571,7 @@ Student answer:
 Return strict JSON only with these keys:
 - verdict: "correct" or "incorrect"
 - confidence: number from 0 to 1
+- similarity: number from 0 to 1 (meaning equivalence estimate)
 - reason: short one-sentence explanation (max 20 words)
 """
 
@@ -1567,7 +1581,7 @@ Return strict JSON only with these keys:
                 {"role": "system", "content": "You are a strict semantic grader."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.0,
+            temperature=0.1,
             max_tokens=180,
         )
 
@@ -1597,6 +1611,18 @@ Return strict JSON only with these keys:
             confidence = 0.5
         confidence = max(0.0, min(1.0, confidence))
 
+        similarity = parsed.get("similarity", None)
+        try:
+            similarity = float(similarity)
+        except Exception:
+            similarity = confidence
+        similarity = max(0.0, min(1.0, similarity))
+
+        # Lenient override: if model says "incorrect" but semantic similarity is moderate,
+        # treat as correct to avoid over-penalizing close answers.
+        if verdict == "incorrect" and similarity >= 0.62 and confidence <= 0.9:
+            verdict = "correct"
+
         reason = str(parsed.get("reason", "")).strip()
         if not reason:
             reason = "Meaning judged equivalent." if verdict == "correct" else "Meaning differs from the expected sentence."
@@ -1606,6 +1632,7 @@ Return strict JSON only with these keys:
             "ok": ok,
             "verdict": verdict,
             "confidence": confidence,
+            "similarity": similarity,
             "reason": reason,
             "remaining_credits": remaining,
             "limit": FREE_AI_CREDITS
