@@ -593,6 +593,7 @@ class Flashcard(BaseModel):
     morph: Optional[str] = ""
     context: Optional[str] = ""
     translation: Optional[str] = ""
+    annotation: Optional[str] = ""
     created_at: Optional[str] = ""
 
 
