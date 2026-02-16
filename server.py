@@ -490,6 +490,12 @@ class ExplainPassage(BaseModel):
     prompt_memory: Optional[str] = ""
 
 
+class MemorizeJudgeRequest(BaseModel):
+    expected_text: str
+    user_answer: str
+    mode: Optional[str] = "original"
+
+
 class WorkAnnotationToken(BaseModel):
     id: str
     text: str
@@ -1183,6 +1189,7 @@ def create_checkout_session(request: Request):
     session = stripe.checkout.Session.create(
         mode="subscription",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        allow_promotion_codes=True,
         billing_address_collection="required",
         success_url=f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{origin}/index.html",
@@ -1516,6 +1523,101 @@ def ai_credits(request: Request):
 
     remaining = get_free_ai_remaining(request)
     return {"pro": False, "remaining_credits": remaining, "limit": FREE_AI_CREDITS}
+
+
+@app.post("/ai/memorize-judge")
+def memorize_judge(req: MemorizeJudgeRequest, request: Request):
+    try:
+        expected_text = (req.expected_text or "").strip()
+        user_answer = (req.user_answer or "").strip()
+        mode = (req.mode or "original").strip() or "original"
+
+        if not expected_text:
+            raise HTTPException(status_code=400, detail="expected_text required")
+        if not user_answer:
+            raise HTTPException(status_code=400, detail="user_answer required")
+
+        pro = request.headers.get("X-Pro-Token")
+        remaining = None
+        if not has_pro(pro):
+            remaining = consume_free_ai_credit(request)
+
+        prompt = f"""
+You are grading a memorisation exercise.
+Compare the expected sentence and the student's answer by meaning.
+Accept close paraphrases and minor wording, punctuation, or inflection differences.
+Reject if key meaning changes, key facts/entities are missing, or polarity changes.
+
+Mode: {mode}
+Expected:
+{expected_text}
+
+Student answer:
+{user_answer}
+
+Return strict JSON only with these keys:
+- verdict: "correct" or "incorrect"
+- confidence: number from 0 to 1
+- reason: short one-sentence explanation (max 20 words)
+"""
+
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a strict semantic grader."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=180,
+        )
+
+        raw = (r.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+
+        parsed: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except Exception:
+                    parsed = {}
+
+        verdict = str(parsed.get("verdict", "")).strip().lower()
+        if verdict not in ("correct", "incorrect"):
+            verdict = "correct" if "correct" in raw.lower() else "incorrect"
+
+        confidence = parsed.get("confidence", None)
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+
+        reason = str(parsed.get("reason", "")).strip()
+        if not reason:
+            reason = "Meaning judged equivalent." if verdict == "correct" else "Meaning differs from the expected sentence."
+
+        ok = verdict == "correct"
+        return {
+            "ok": ok,
+            "verdict": verdict,
+            "confidence": confidence,
+            "reason": reason,
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS
+        }
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print("AI ERROR (memorize judge):", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
 
 
 @app.post("/ai/explain-word")
