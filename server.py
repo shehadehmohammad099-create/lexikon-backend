@@ -653,7 +653,7 @@ class EmailCorpusRequest(BaseModel):
 # -------------------------
 
 MAX_WORK_ANNOTATE_SECTIONS = 36
-MAX_WORK_ANNOTATE_SECTION_CHARS = 800
+MAX_WORK_ANNOTATE_SECTION_CHARS = 24000
 MIN_WORK_ANNOTATIONS = 5
 MAX_WORK_ANNOTATIONS = 8
 MAX_PODCAST_SOURCE_CHARS = 30000
@@ -679,6 +679,31 @@ def build_podcast_source_text(sections: List[dict]) -> str:
         parts.append(block)
         total += len(block)
     return "".join(parts).strip()
+
+
+def sample_token_ids(token_rows: List[dict], limit: int = 24) -> List[str]:
+    """Pick token ids across the section (start/middle/end), not only from the beginning."""
+    if not token_rows:
+        return []
+    ids = [str(t.get("id") or "").strip() for t in token_rows if str(t.get("id") or "").strip()]
+    if len(ids) <= limit:
+        return ids
+
+    picked = []
+    n = len(ids)
+    for i in range(limit):
+        idx = round(i * (n - 1) / max(1, (limit - 1)))
+        picked.append(ids[idx])
+
+    # Preserve order while dropping duplicates from rounding collisions.
+    seen = set()
+    out = []
+    for token_id in picked:
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        out.append(token_id)
+    return out
 
 
 def normalize_podcast_minutes(value: Optional[int]) -> int:
@@ -2036,7 +2061,7 @@ Sections provided: {len(normalized_sections)}
         if not annotations:
             fallback_blocks = []
             for sec in normalized_sections:
-                token_ids = [tok["id"] for tok in sec["tokens"][:24]]
+                token_ids = sample_token_ids(sec["tokens"], limit=24)
                 if not token_ids:
                     continue
                 fallback_blocks.append(
