@@ -654,8 +654,8 @@ class EmailCorpusRequest(BaseModel):
 
 MAX_WORK_ANNOTATE_SECTIONS = 36
 MAX_WORK_ANNOTATE_SECTION_CHARS = 24000
-MIN_WORK_ANNOTATIONS = 5
-MAX_WORK_ANNOTATIONS = 8
+MIN_WORK_ANNOTATIONS = 6
+MAX_WORK_ANNOTATIONS = 10
 MAX_PODCAST_SOURCE_CHARS = 30000
 MIN_PODCAST_MINUTES = 4
 MAX_PODCAST_MINUTES = 25
@@ -1977,7 +1977,7 @@ Sections provided: {len(normalized_sections)}
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
-            max_tokens=1200,
+            max_tokens=1500,
         )
 
         raw = (r.choices[0].message.content or "").strip()
