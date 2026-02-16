@@ -654,8 +654,8 @@ class EmailCorpusRequest(BaseModel):
 
 MAX_WORK_ANNOTATE_SECTIONS = 36
 MAX_WORK_ANNOTATE_SECTION_CHARS = 24000
-MIN_WORK_ANNOTATIONS = 6
-MAX_WORK_ANNOTATIONS = 10
+MIN_WORK_ANNOTATIONS = 8
+MAX_WORK_ANNOTATIONS = 14
 MAX_PODCAST_SOURCE_CHARS = 30000
 MIN_PODCAST_MINUTES = 4
 MAX_PODCAST_MINUTES = 25
@@ -1887,6 +1887,7 @@ Use this as supporting context when helpful, but prioritize the source text.
 
         normalized_sections = []
         allowed_tokens_by_section = {}
+        token_position_by_section = {}
         for sec in req.sections[:MAX_WORK_ANNOTATE_SECTIONS]:
             text = (sec.text or "").strip()
             if not text:
@@ -1903,6 +1904,9 @@ Use this as supporting context when helpful, but prioritize the source text.
                     "text": token_text[:64]
                 })
             allowed_tokens_by_section[section_id] = {t["id"] for t in normalized_tokens}
+            token_position_by_section[section_id] = {
+                t["id"]: idx for idx, t in enumerate(normalized_tokens)
+            }
             normalized_sections.append({
                 "id": section_id,
                 "label": (sec.label or sec.id or "").strip(),
@@ -1955,7 +1959,7 @@ Output format:
 Rules:
 - Return {MIN_WORK_ANNOTATIONS}-{MAX_WORK_ANNOTATIONS} annotations total (if enough valid sections/tokens exist).
 - Prioritize only the strongest, highest-signal observations.
-- Prefer at most 1 annotation per section unless an additional note is clearly exceptional.
+- For each section, distribute annotations across beginning, middle, and end when possible; avoid clustering only in the opening lines.
 - Each note under 28 words.
 - Notes should mention style and/or content insight useful for reading.
 - Use only provided section_id/token_id values.
@@ -2021,18 +2025,66 @@ Sections provided: {len(normalized_sections)}
                     continue
                 seen.add(key)
                 deduped.append(item)
-            if len(deduped) <= MAX_WORK_ANNOTATIONS:
-                return deduped
-            ranked = []
-            for idx, item in enumerate(deduped):
-                ranked.append((
+            def rank_tuple(item: dict, idx: int):
+                return (
                     score_annotation_note(str(item.get("note") or "")),
                     -section_order.get(str(item.get("section_id") or ""), 10_000),
-                    -idx,
-                    item
-                ))
-            ranked.sort(reverse=True)
-            return [x[3] for x in ranked[:MAX_WORK_ANNOTATIONS]]
+                    -idx
+                )
+
+            if len(deduped) <= MAX_WORK_ANNOTATIONS:
+                return deduped
+
+            # Prefer coverage diversity across section thirds before pure score trimming.
+            per_bucket = {}
+            for idx, item in enumerate(deduped):
+                sid = str(item.get("section_id") or "")
+                tid = str(item.get("token_id") or "")
+                positions = token_position_by_section.get(sid) or {}
+                pos = positions.get(tid, 0)
+                total = max(1, len(positions))
+                ratio = pos / total
+                bucket = 0 if ratio < 0.34 else (1 if ratio < 0.67 else 2)
+                key = (sid, bucket)
+                per_bucket.setdefault(key, []).append((rank_tuple(item, idx), item))
+
+            selected = []
+            picked = set()
+            for key, rows_for_bucket in sorted(per_bucket.items(), key=lambda x: (section_order.get(x[0][0], 10_000), x[0][1])):
+                rows_for_bucket.sort(reverse=True, key=lambda x: x[0])
+                best = rows_for_bucket[0][1] if rows_for_bucket else None
+                if not best:
+                    continue
+                uniq = (
+                    str(best.get("section_id") or "").strip(),
+                    str(best.get("token_id") or "").strip(),
+                    str(best.get("note") or "").strip().lower(),
+                )
+                if uniq in picked:
+                    continue
+                selected.append(best)
+                picked.add(uniq)
+                if len(selected) >= MAX_WORK_ANNOTATIONS:
+                    break
+
+            if len(selected) < MAX_WORK_ANNOTATIONS:
+                ranked_all = []
+                for idx, item in enumerate(deduped):
+                    uniq = (
+                        str(item.get("section_id") or "").strip(),
+                        str(item.get("token_id") or "").strip(),
+                        str(item.get("note") or "").strip().lower(),
+                    )
+                    if uniq in picked:
+                        continue
+                    ranked_all.append((rank_tuple(item, idx), item))
+                ranked_all.sort(reverse=True, key=lambda x: x[0])
+                for _, item in ranked_all:
+                    selected.append(item)
+                    if len(selected) >= MAX_WORK_ANNOTATIONS:
+                        break
+
+            return selected[:MAX_WORK_ANNOTATIONS]
 
         if isinstance(parsed, dict):
             ov = parsed.get("overview")
@@ -2077,7 +2129,7 @@ section_id|token_id|note
 Rules:
 - Return {MIN_WORK_ANNOTATIONS}-{MAX_WORK_ANNOTATIONS} lines total (or fewer only if fewer valid sections/tokens exist).
 - Focus on strongest reading cues, not exhaustive coverage.
-- Prefer at most 1 line per section.
+- Spread lines across beginning/middle/end token ranges for each section when possible.
 - token_id must be from the TOKENS list for that section.
 - note max 24 words and about style/content reading cues.
 - No extra text before or after lines.
