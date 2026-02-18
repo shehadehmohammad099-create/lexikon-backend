@@ -510,6 +510,18 @@ class ExamMarkRequest(BaseModel):
     user_answer: str
 
 
+class ExamFixRequest(BaseModel):
+    level: str
+    focus: str
+    work_title: Optional[str] = ""
+    section_id: Optional[str] = ""
+    section_label: Optional[str] = ""
+    passage: str
+    question: str
+    user_answer: str
+    feedback: str
+
+
 class MemorizeJudgeRequest(BaseModel):
     expected_text: str
     user_answer: str
@@ -2052,6 +2064,95 @@ Student answer:
         raise e
     except Exception as e:
         print("AI ERROR (exam-mark):", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/ai/exam-fix")
+def fix_exam_answer(req: ExamFixRequest, request: Request):
+    try:
+        level = (req.level or "").strip().lower()
+        focus = (req.focus or "").strip().lower()
+        passage = (req.passage or "").strip()
+        question = (req.question or "").strip()
+        user_answer = (req.user_answer or "").strip()
+        feedback = (req.feedback or "").strip()
+
+        if level not in {"gcse", "a-level", "a_level"}:
+            raise HTTPException(status_code=400, detail="Invalid level")
+        if focus not in {"ao3_style", "ao2_knowledge", "balanced"}:
+            raise HTTPException(status_code=400, detail="Invalid focus")
+        if not passage:
+            raise HTTPException(status_code=400, detail="passage required")
+        if not question:
+            raise HTTPException(status_code=400, detail="question required")
+        if not user_answer:
+            raise HTTPException(status_code=400, detail="user_answer required")
+        if not feedback:
+            raise HTTPException(status_code=400, detail="feedback required")
+
+        normalized_level = "A-Level" if level in {"a-level", "a_level"} else "GCSE"
+        focus_label = {
+            "ao3_style": "style-heavy (AO3 focus)",
+            "ao2_knowledge": "knowledge-heavy (AO2 focus)",
+            "balanced": "balanced AO2/AO3"
+        }.get(focus, "balanced AO2/AO3")
+
+        pro = request.headers.get("X-Pro-Token")
+        remaining = None
+        if not has_pro(pro):
+            remaining = consume_free_ai_credit(request)
+
+        prompt = f"""
+You are improving a student's classics exam answer to a higher band while preserving its original argument.
+Rewrite the answer for {normalized_level} with this focus: {focus_label}.
+
+Rules:
+- Keep the student's core claim and intent.
+- Raise analytical quality, precision, and evidence use.
+- Integrate stronger AO2 and AO3 reasoning where relevant.
+- Use concise paragraphing.
+- Keep the answer realistic for a student under exam conditions.
+- Do not add headings, bullet points, or meta commentary.
+- Return only the improved answer text.
+
+Work: {req.work_title}
+Section: {req.section_label or req.section_id}
+Question:
+{question}
+
+Passage:
+{passage[:12000]}
+
+Student answer:
+{user_answer[:12000]}
+
+Examiner feedback to address:
+{feedback[:5000]}
+"""
+
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a precise classics tutor who rewrites answers to stronger exam bands."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.35,
+            max_tokens=900,
+        )
+
+        improved_answer = (r.choices[0].message.content or "").strip()
+        return {
+            "improved_answer": improved_answer,
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS
+        }
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print("AI ERROR (exam-fix):", e)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
