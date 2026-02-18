@@ -1241,17 +1241,29 @@ def email_corpus(payload: EmailCorpusRequest):
 # -------------------------
 
 @app.get("/create-checkout-session")
-def create_checkout_session(request: Request):
+def create_checkout_session(request: Request, promo: Optional[str] = None):
     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
+    promo_code = (promo or "").strip()
+    checkout_payload = {
+        "mode": "subscription",
+        "line_items": [{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        "allow_promotion_codes": True,
+        "billing_address_collection": "required",
+        "success_url": f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{origin}/index.html",
+    }
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        allow_promotion_codes=True,
-        billing_address_collection="required",
-        success_url=f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{origin}/index.html",
-    )
+    if promo_code:
+        matches = stripe.PromotionCode.list(
+            code=promo_code,
+            active=True,
+            limit=1,
+        )
+        if not matches.data:
+            raise HTTPException(status_code=400, detail="Invalid or inactive promo code")
+        checkout_payload["discounts"] = [{"promotion_code": matches.data[0].id}]
+
+    session = stripe.checkout.Session.create(**checkout_payload)
 
     return {"url": session.url}
 
