@@ -2078,11 +2078,28 @@ Translation (for reference only):
 
 
 @app.post("/ai/exam-question")
-def generate_exam_question(req: ExamQuestionRequest, request: Request):
+def generate_exam_question(request: Request, req: Dict[str, Any] = Body(default_factory=dict)):
     try:
-        level = (req.level or "").strip().lower()
-        focus = (req.focus or "").strip().lower()
-        passage = (req.passage or "").strip()
+        if not isinstance(req, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+        def as_text(v):
+            if v is None:
+                return ""
+            return v if isinstance(v, str) else str(v)
+
+        level = as_text(
+            req.get("level", req.get("exam_level", req.get("examLevel", "")))
+        ).strip().lower()
+        focus = as_text(
+            req.get("focus", req.get("exam_focus", req.get("examFocus", "")))
+        ).strip().lower()
+        passage = as_text(
+            req.get("passage", req.get("passage_text", req.get("passageText", req.get("text", ""))))
+        ).strip()
+        work_title = as_text(req.get("work_title", req.get("workTitle", req.get("work", ""))))
+        section_id = as_text(req.get("section_id", req.get("sectionId", "")))
+        section_label = as_text(req.get("section_label", req.get("sectionLabel", "")))
 
         if level not in {"gcse", "a-level", "a_level"}:
             raise HTTPException(status_code=400, detail="Invalid level")
@@ -2116,8 +2133,8 @@ Requirements:
 - Keep wording precise and rigorous, but student-accessible.
 - Return only the question text, no numbering, no markdown, no extra commentary.
 
-Work: {req.work_title}
-Section: {req.section_label or req.section_id}
+Work: {work_title}
+Section: {section_label or section_id}
 
 Passage:
 {passage[:12000]}
