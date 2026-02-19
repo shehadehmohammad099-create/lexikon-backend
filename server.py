@@ -1,5 +1,6 @@
 import os
 import secrets
+import hashlib
 import stripe
 import openai
 from datetime import datetime, timedelta
@@ -329,6 +330,12 @@ STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 FRONTEND_URL = os.environ["FRONTEND_URL"]
 FREE_AI_CREDITS = int(os.environ.get("FREE_AI_CREDITS", "5"))
+POSTHOG_PROJECT_API_KEY = (
+    os.environ.get("POSTHOG_PROJECT_API_KEY")
+    or os.environ.get("POSTHOG_API_KEY")
+    or ""
+)
+POSTHOG_API_HOST = (os.environ.get("POSTHOG_API_HOST") or "https://us.i.posthog.com").rstrip("/")
 
 openai.api_key = OPENAI_API_KEY
 stripe.api_key = STRIPE_SECRET_KEY
@@ -465,6 +472,63 @@ def get_frontend_origin(request: Request) -> str:
             return clean_origin(f"{parsed.scheme}://{parsed.netloc}")
 
     return clean_origin(FRONTEND_URL)
+
+
+def short_hash(value: str) -> str:
+    raw = (value or "").strip().encode("utf-8")
+    if not raw:
+        return ""
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def analytics_distinct_id(request: Request, customer_id: Optional[str] = None) -> str:
+    if customer_id:
+        return f"cust:{customer_id}"
+
+    pro = request.headers.get("X-Pro-Token")
+    token_customer = customer_from_token(pro)
+    if token_customer:
+        return f"cust:{token_customer}"
+
+    anon_id = get_anon_id(request)
+    if anon_id:
+        return anon_id
+
+    host = request.client.host if request.client else ""
+    if host:
+        return f"ip:{short_hash(host)}"
+
+    return "server:anonymous"
+
+
+def track_server_event(
+    event: str,
+    request: Request,
+    customer_id: Optional[str] = None,
+    properties: Optional[Dict[str, Any]] = None,
+):
+    if not POSTHOG_PROJECT_API_KEY:
+        return
+
+    try:
+        props = {
+            "$lib": "lexikon-backend",
+            "source": "backend",
+            "path": request.url.path,
+            "method": request.method,
+        }
+        if properties:
+            props.update({k: v for k, v in properties.items() if v is not None})
+
+        payload = {
+            "api_key": POSTHOG_PROJECT_API_KEY,
+            "event": event,
+            "distinct_id": analytics_distinct_id(request, customer_id=customer_id),
+            "properties": props,
+        }
+        requests.post(f"{POSTHOG_API_HOST}/capture/", json=payload, timeout=1.5)
+    except Exception as e:
+        print(f"PostHog server tracking failed ({event}): {e}")
 
 
 # -------------------------
@@ -1191,11 +1255,13 @@ def send_corpus_email(to_email: str, subject: str, markdown: str):
 
 
 @app.post("/email/annotations")
-def email_annotations(payload: EmailAnnotationsRequest):
+def email_annotations(payload: EmailAnnotationsRequest, request: Request):
     email = (payload.email or "").strip().lower()
     if not email:
+        track_server_event("email_annotations_failed", request, properties={"reason": "missing_email"})
         raise HTTPException(status_code=400, detail="Email required")
     if not payload.rows:
+        track_server_event("email_annotations_failed", request, properties={"reason": "no_rows"})
         raise HTTPException(status_code=400, detail="No annotations to send")
 
     with get_db() as cur:
@@ -1211,16 +1277,27 @@ def email_annotations(payload: EmailAnnotationsRequest):
         )
 
     send_annotations_email(email, payload.work_title or "Annotations", payload.rows)
+    track_server_event(
+        "email_annotations_sent",
+        request,
+        properties={
+            "work_id": payload.work_id or "",
+            "row_count": len(payload.rows or []),
+            "email_domain": email.split("@")[-1] if "@" in email else "",
+        },
+    )
     return {"ok": True}
 
 
 @app.post("/email/corpus")
-def email_corpus(payload: EmailCorpusRequest):
+def email_corpus(payload: EmailCorpusRequest, request: Request):
     email = (payload.email or "").strip().lower()
     markdown = (payload.markdown or "").strip()
     if not email:
+        track_server_event("email_corpus_failed", request, properties={"reason": "missing_email"})
         raise HTTPException(status_code=400, detail="Email required")
     if not markdown:
+        track_server_event("email_corpus_failed", request, properties={"reason": "empty_markdown"})
         raise HTTPException(status_code=400, detail="Nothing to export")
 
     with get_db() as cur:
@@ -1233,6 +1310,15 @@ def email_corpus(payload: EmailCorpusRequest):
         """, (email, "export:corpus"))
 
     send_corpus_email(email, payload.subject or "Your Lexikon personal corpus", markdown)
+    track_server_event(
+        "email_corpus_sent",
+        request,
+        properties={
+            "subject": payload.subject or "Your Lexikon personal corpus",
+            "word_count": count_words(markdown),
+            "email_domain": email.split("@")[-1] if "@" in email else "",
+        },
+    )
     return {"ok": True}
 
 
@@ -1260,10 +1346,23 @@ def create_checkout_session(request: Request, promo: Optional[str] = None):
             limit=1,
         )
         if not matches.data:
+            track_server_event(
+                "checkout_session_failed",
+                request,
+                properties={"reason": "invalid_promo", "promo_code": promo_code},
+            )
             raise HTTPException(status_code=400, detail="Invalid or inactive promo code")
         checkout_payload["discounts"] = [{"promotion_code": matches.data[0].id}]
 
     session = stripe.checkout.Session.create(**checkout_payload)
+    track_server_event(
+        "checkout_session_created",
+        request,
+        properties={
+            "has_promo_code": bool(promo_code),
+            "origin": origin,
+        },
+    )
 
     return {"url": session.url}
 
@@ -1280,7 +1379,14 @@ async def stripe_webhook(request: Request):
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         )
     except Exception as e:
+        track_server_event("stripe_webhook_invalid", request, properties={"error": str(e)[:180]})
         raise HTTPException(status_code=400, detail=str(e))
+
+    track_server_event(
+        "stripe_webhook_received",
+        request,
+        properties={"event_type": event.get("type")},
+    )
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
@@ -1299,6 +1405,12 @@ async def stripe_webhook(request: Request):
 
         restore_url = f"{origin}/app.html?restore_token={restore_token}"
         send_restore_email(email, restore_url)
+        track_server_event(
+            "stripe_checkout_completed",
+            request,
+            customer_id=customer_id,
+            properties={"email_domain": email.split("@")[-1] if "@" in email else ""},
+        )
 
     return {"ok": True}
 
@@ -1346,6 +1458,12 @@ def checkout_success(session_id: str, request: Request):
         #     send_restore_email(email, restore_url)
         # else:
         #     print("⚠️ No email found, skipping restore email")
+        track_server_event(
+            "checkout_success_token_issued",
+            request,
+            customer_id=customer_id,
+            properties={"has_email": bool(email)},
+        )
 
         return {"pro_token": pro_token}
 
@@ -1353,6 +1471,7 @@ def checkout_success(session_id: str, request: Request):
         raise e
     except Exception as e:
         print("CHECKOUT ERROR:", e)
+        track_server_event("checkout_success_failed", request, properties={"error": str(e)[:180]})
         return {"error": str(e)}
 
 
@@ -1366,6 +1485,7 @@ async def request_restore(request: Request):
     email = payload.get("email")
 
     if not email:
+        track_server_event("billing_restore_requested", request, properties={"status": "missing_email"})
         raise HTTPException(status_code=400, detail="Email required")
 
     customers = stripe.Customer.search(
@@ -1375,6 +1495,11 @@ async def request_restore(request: Request):
 
     if not customers:
         print(f"⚠️ No customer found for {email}")
+        track_server_event(
+            "billing_restore_requested",
+            request,
+            properties={"status": "no_customer", "email_domain": email.split("@")[-1] if "@" in email else ""},
+        )
         return {"ok": True}
 
     customer = customers[0]
@@ -1387,6 +1512,12 @@ async def request_restore(request: Request):
 
     if not subs:
         print(f"⚠️ No active subscription for {email}")
+        track_server_event(
+            "billing_restore_requested",
+            request,
+            customer_id=customer.id,
+            properties={"status": "no_active_subscription"},
+        )
         return {"ok": True}
 
     restore_token = secrets.token_urlsafe(32)
@@ -1403,6 +1534,12 @@ async def request_restore(request: Request):
 
     print(f"📧 Sending restore email to {email}...")
     send_restore_email(email, restore_url)
+    track_server_event(
+        "billing_restore_requested",
+        request,
+        customer_id=customer.id,
+        properties={"status": "email_sent", "email_domain": email.split("@")[-1] if "@" in email else ""},
+    )
 
     return {"ok": True}
 
@@ -1413,6 +1550,7 @@ async def restore_from_link(request: Request):
     token = payload.get("restore_token")
 
     if not token:
+        track_server_event("billing_restore_link_used", request, properties={"status": "missing_token"})
         raise HTTPException(status_code=400, detail="Missing token")
 
     with get_db() as cur:
@@ -1425,6 +1563,7 @@ async def restore_from_link(request: Request):
 
         row = cur.fetchone()
         if not row:
+            track_server_event("billing_restore_link_used", request, properties={"status": "invalid_or_expired"})
             raise HTTPException(status_code=400, detail="Invalid or expired link")
 
         customer_id = row["customer_id"]
@@ -1436,6 +1575,12 @@ async def restore_from_link(request: Request):
         ).data
 
         if not subs:
+            track_server_event(
+                "billing_restore_link_used",
+                request,
+                customer_id=customer_id,
+                properties={"status": "no_active_subscription"},
+            )
             raise HTTPException(status_code=402, detail="No active subscription")
 
         pro_token = secrets.token_urlsafe(32)
@@ -1447,6 +1592,12 @@ async def restore_from_link(request: Request):
 
         cur.execute("DELETE FROM restore_tokens WHERE token = %s", (token,))
 
+    track_server_event(
+        "billing_restore_link_used",
+        request,
+        customer_id=customer_id,
+        properties={"status": "restored"},
+    )
     return {"pro_token": pro_token}
 
 
@@ -1609,7 +1760,8 @@ def memorize_judge(req: MemorizeJudgeRequest, request: Request):
 
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        uses_pro = has_pro(pro)
+        if not uses_pro:
             remaining = consume_free_ai_credit(request)
 
         prompt = f"""
@@ -1698,6 +1850,17 @@ Return strict JSON only with these keys:
             reason = "Meaning judged equivalent." if verdict == "correct" else "Meaning differs from the expected sentence."
 
         ok = verdict == "correct"
+        track_server_event(
+            "memorize_judge_completed",
+            request,
+            properties={
+                "mode": mode,
+                "ok": ok,
+                "confidence": confidence,
+                "similarity": similarity,
+                "used_pro": uses_pro,
+            },
+        )
         return {
             "ok": ok,
             "verdict": verdict,
@@ -1711,6 +1874,7 @@ Return strict JSON only with these keys:
         raise e
     except Exception as e:
         print("AI ERROR (memorize judge):", e)
+        track_server_event("memorize_judge_failed", request, properties={"error": str(e)[:180]})
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
@@ -2598,6 +2762,12 @@ def save_podcast_feedback(req: SavePodcastFeedbackRequest, request: Request):
         VALUES (%s, %s, %s, %s)
         """, (customer_id, req.work_id, key, (req.note or "")[:500]))
 
+    track_server_event(
+        "podcast_feedback_saved",
+        request,
+        customer_id=customer_id,
+        properties={"work_id": req.work_id, "feedback_key": key},
+    )
     return {"ok": True}
 
 
@@ -2773,6 +2943,12 @@ def delete_podcast(work_id: str, request: Request):
         DELETE FROM podcasts
         WHERE customer_id = %s AND work_id = %s
         """, (customer_id, target_id))
+    track_server_event(
+        "podcast_deleted",
+        request,
+        customer_id=customer_id,
+        properties={"work_id": target_id},
+    )
     return {"ok": True, "work_id": target_id}
 
 
@@ -2846,6 +3022,18 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
         base_url = str(request.base_url).rstrip("/")
         audio_url = f"{base_url}/podcasts/{req.work_id}/audio"
         print(f"🎙️ done audio_url={audio_url}")
+        track_server_event(
+            "podcast_generated",
+            request,
+            customer_id=customer_id,
+            properties={
+                "work_id": req.work_id,
+                "section_count": len(req.sections or []),
+                "target_minutes": req.target_minutes,
+                "tone": req.tone,
+                "depth": req.depth,
+            },
+        )
         return {
             "ok": True,
             "work_id": req.work_id,
@@ -2858,9 +3046,15 @@ def generate_podcast(req: PodcastGenerateRequest, request: Request):
         }
     except HTTPException as e:
         print(f"❌ Podcast generate HTTP error: {e.detail}")
+        track_server_event(
+            "podcast_generate_failed",
+            request,
+            properties={"error": str(e.detail)[:180]},
+        )
         raise e
     except Exception as e:
         print(f"❌ Podcast generate error: {e}")
+        track_server_event("podcast_generate_failed", request, properties={"error": str(e)[:180]})
         raise e
 
 
@@ -2889,6 +3083,16 @@ def save_annotation(req: SaveAnnotation, request: Request):
               AND section_id = %s
               AND token_id IS NOT DISTINCT FROM %s
             """, (customer_id, req.work_id, req.section_id, req.token_id))
+            track_server_event(
+                "annotation_deleted",
+                request,
+                customer_id=customer_id,
+                properties={
+                    "work_id": req.work_id,
+                    "section_id": req.section_id,
+                    "token_id": req.token_id or "",
+                },
+            )
             return {"deleted": True}
 
         cur.execute("""
@@ -2898,6 +3102,18 @@ def save_annotation(req: SaveAnnotation, request: Request):
         DO UPDATE SET content = EXCLUDED.content, visibility = EXCLUDED.visibility, updated_at = NOW()
         """, (customer_id, req.work_id, req.section_id, req.token_id, req.content, visibility))
 
+    track_server_event(
+        "annotation_saved",
+        request,
+        customer_id=customer_id,
+        properties={
+            "work_id": req.work_id,
+            "section_id": req.section_id,
+            "token_id": req.token_id or "",
+            "visibility": visibility,
+            "content_length": len(req.content or ""),
+        },
+    )
     return {"ok": True}
 
 
@@ -2918,6 +3134,16 @@ def save_phrase_annotation(req: SavePhraseAnnotation, request: Request):
             WHERE customer_id = %s
               AND id = %s
             """, (customer_id, item_id))
+            track_server_event(
+                "phrase_annotation_deleted",
+                request,
+                customer_id=customer_id,
+                properties={
+                    "id": item_id,
+                    "work_id": req.work_id,
+                    "section_id": req.section_id,
+                },
+            )
             return {"deleted": True, "id": item_id}
 
         token_ids = [str(t).strip() for t in (req.token_ids or []) if str(t).strip()]
@@ -2943,6 +3169,18 @@ def save_phrase_annotation(req: SavePhraseAnnotation, request: Request):
             meaning
         ))
 
+    track_server_event(
+        "phrase_annotation_saved",
+        request,
+        customer_id=customer_id,
+        properties={
+            "id": item_id,
+            "work_id": req.work_id,
+            "section_id": req.section_id,
+            "token_count": len(token_ids),
+            "meaning_length": len(meaning),
+        },
+    )
     return {"ok": True, "id": item_id}
 
 
@@ -3626,6 +3864,12 @@ def list_flashcards(request: Request):
         ORDER BY updated_at DESC
         """, (customer_id,))
         rows = cur.fetchall() or []
+        track_server_event(
+            "flashcards_list_viewed",
+            request,
+            customer_id=customer_id,
+            properties={"set_count": len(rows)},
+        )
         return {"sets": rows}
 
 
@@ -3657,6 +3901,16 @@ def sync_flashcards(req: FlashcardSyncRequest, request: Request):
                 updated_at
             ))
 
+    total_cards = sum(len(s.cards or []) for s in (req.sets or []))
+    track_server_event(
+        "flashcards_synced",
+        request,
+        customer_id=customer_id,
+        properties={
+            "set_count": len(req.sets or []),
+            "card_count": total_cards,
+        },
+    )
     return {"ok": True}
 
 
@@ -3671,4 +3925,9 @@ def delete_all_flashcards(request: Request):
         WHERE user_id = %s
         """, (customer_id,))
 
+    track_server_event(
+        "flashcards_deleted_all",
+        request,
+        customer_id=customer_id,
+    )
     return {"ok": True}
