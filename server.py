@@ -1330,41 +1330,58 @@ def email_corpus(payload: EmailCorpusRequest, request: Request):
 def create_checkout_session(request: Request, promo: Optional[str] = None):
     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
     promo_code = (promo or "").strip()
-    checkout_payload = {
-        "mode": "subscription",
-        "line_items": [{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        "allow_promotion_codes": True,
-        "billing_address_collection": "required",
-        "success_url": f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
-        "cancel_url": f"{origin}/index.html",
-    }
+    try:
+        # Stripe price type drives checkout mode:
+        # recurring -> subscription, one-time -> payment
+        price = stripe.Price.retrieve(STRIPE_PRICE_ID)
+        recurring = price.get("recurring")
+        checkout_mode = "subscription" if recurring else "payment"
 
-    if promo_code:
-        matches = stripe.PromotionCode.list(
-            code=promo_code,
-            active=True,
-            limit=1,
-        )
-        if not matches.data:
-            track_server_event(
-                "checkout_session_failed",
-                request,
-                properties={"reason": "invalid_promo", "promo_code": promo_code},
+        checkout_payload = {
+            "mode": checkout_mode,
+            "line_items": [{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            "allow_promotion_codes": True,
+            "billing_address_collection": "required",
+            "success_url": f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{origin}/index.html",
+        }
+
+        if promo_code:
+            matches = stripe.PromotionCode.list(
+                code=promo_code,
+                active=True,
+                limit=1,
             )
-            raise HTTPException(status_code=400, detail="Invalid or inactive promo code")
-        checkout_payload["discounts"] = [{"promotion_code": matches.data[0].id}]
+            if not matches.data:
+                track_server_event(
+                    "checkout_session_failed",
+                    request,
+                    properties={"reason": "invalid_promo", "promo_code": promo_code},
+                )
+                raise HTTPException(status_code=400, detail="Invalid or inactive promo code")
+            checkout_payload["discounts"] = [{"promotion_code": matches.data[0].id}]
 
-    session = stripe.checkout.Session.create(**checkout_payload)
-    track_server_event(
-        "checkout_session_created",
-        request,
-        properties={
-            "has_promo_code": bool(promo_code),
-            "origin": origin,
-        },
-    )
-
-    return {"url": session.url}
+        session = stripe.checkout.Session.create(**checkout_payload)
+        track_server_event(
+            "checkout_session_created",
+            request,
+            properties={
+                "has_promo_code": bool(promo_code),
+                "origin": origin,
+                "mode": checkout_mode,
+            },
+        )
+        return {"url": session.url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("CHECKOUT SESSION ERROR:", e)
+        track_server_event(
+            "checkout_session_failed",
+            request,
+            properties={"reason": "stripe_error", "error": str(e)[:180]},
+        )
+        raise HTTPException(status_code=502, detail="Checkout initialization failed")
 
 
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
