@@ -390,10 +390,25 @@ def get_anon_id(request: Request) -> str | None:
     return None
 
 
+def maybe_reset_free_ai_credits_window(anon_id: str) -> None:
+    if not anon_id:
+        return
+    with get_db() as cur:
+        cur.execute("""
+        UPDATE free_ai_credits
+        SET used = 0, updated_at = NOW()
+        WHERE user_id = %s
+          AND updated_at < NOW() - INTERVAL '2 days'
+          AND used > 0
+        """, (anon_id,))
+
+
 def get_free_ai_remaining(request: Request) -> int:
     anon_id = get_anon_id(request)
     if not anon_id:
         raise HTTPException(status_code=401, detail="Anonymous ID required")
+
+    maybe_reset_free_ai_credits_window(anon_id)
 
     limit = FREE_AI_CREDITS
     with get_db() as cur:
@@ -408,6 +423,8 @@ def consume_free_ai_credit(request: Request) -> int:
     anon_id = get_anon_id(request)
     if not anon_id:
         raise HTTPException(status_code=401, detail="Anonymous ID required")
+
+    maybe_reset_free_ai_credits_window(anon_id)
 
     limit = FREE_AI_CREDITS
 
@@ -457,6 +474,8 @@ def consume_free_ai_credits(request: Request, amount: int) -> int:
     anon_id = get_anon_id(request)
     if not anon_id:
         raise HTTPException(status_code=401, detail="Anonymous ID required")
+
+    maybe_reset_free_ai_credits_window(anon_id)
 
     limit = FREE_AI_CREDITS
 
