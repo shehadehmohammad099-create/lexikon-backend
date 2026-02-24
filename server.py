@@ -449,6 +449,55 @@ def consume_free_ai_credit(request: Request) -> int:
     )
 
 
+def consume_free_ai_credits(request: Request, amount: int) -> int:
+    count = max(1, int(amount or 1))
+    if count == 1:
+        return consume_free_ai_credit(request)
+
+    anon_id = get_anon_id(request)
+    if not anon_id:
+        raise HTTPException(status_code=401, detail="Anonymous ID required")
+
+    limit = FREE_AI_CREDITS
+
+    with get_db() as cur:
+        cur.execute("""
+        UPDATE free_ai_credits
+        SET used = used + %s, updated_at = NOW()
+        WHERE user_id = %s AND used <= %s
+        RETURNING used
+        """, (count, anon_id, limit - count))
+        row = cur.fetchone()
+        if row:
+            used = row["used"]
+            return max(limit - used, 0)
+
+        cur.execute("""
+        INSERT INTO free_ai_credits (user_id, used)
+        VALUES (%s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING used
+        """, (anon_id, count))
+        row = cur.fetchone()
+        if row:
+            used = row["used"]
+            return max(limit - used, 0)
+
+        cur.execute("SELECT used FROM free_ai_credits WHERE user_id = %s", (anon_id,))
+        row = cur.fetchone()
+        used = row["used"] if row else limit
+        remaining = max(limit - used, 0)
+
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "error": "Free AI credits exhausted",
+            "remaining_credits": remaining,
+            "limit": limit
+        }
+    )
+
+
 def clean_origin(origin: str) -> str:
     """Strip trailing slash and /static suffix from origin."""
     if not origin:
@@ -590,6 +639,13 @@ class MemorizeJudgeRequest(BaseModel):
     expected_text: str
     user_answer: str
     mode: Optional[str] = "original"
+
+
+class AutoFlashcardsRequest(BaseModel):
+    focus: str = "mix"  # vocab | style | mix
+    count: Optional[int] = 40
+    existing_cards: Optional[List[dict]] = []
+    set_name: Optional[str] = ""
 
 
 class WorkAnnotationToken(BaseModel):
@@ -1892,6 +1948,130 @@ Return strict JSON only with these keys:
     except Exception as e:
         print("AI ERROR (memorize judge):", e)
         track_server_event("memorize_judge_failed", request, properties={"error": str(e)[:180]})
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.post("/ai/autoflashcards")
+def generate_autoflashcards(req: AutoFlashcardsRequest, request: Request):
+    try:
+        focus = (req.focus or "mix").strip().lower()
+        if focus not in {"vocab", "style", "mix"}:
+            raise HTTPException(status_code=400, detail="focus must be vocab, style, or mix")
+
+        target_count = int(req.count or 40)
+        target_count = max(30, min(50, target_count))
+        set_name = (req.set_name or "").strip()
+        existing_cards = req.existing_cards if isinstance(req.existing_cards, list) else []
+        existing_preview = existing_cards[:12]
+
+        pro = request.headers.get("X-Pro-Token")
+        uses_pro = has_pro(pro)
+        remaining = None
+        if not uses_pro:
+            remaining = consume_free_ai_credits(request, 2)
+
+        prompt = f"""
+You are generating flashcards for a classical-languages revision app.
+
+Task:
+- Generate exactly {target_count} flashcards.
+- Focus mode: {focus}.
+- Keep cards concise and exam-useful.
+- Avoid duplicates and near-duplicates.
+- Return JSON only.
+
+Output format:
+{{
+  "cards": [
+    {{
+      "text": "front side term or cue",
+      "lemma": "dictionary form or short heading",
+      "annotation": "definition/style note",
+      "translation": "optional translation"
+    }}
+  ]
+}}
+
+Rules by focus:
+- vocab: mostly vocabulary meaning + usage.
+- style: mostly rhetorical/literary technique cards.
+- mix: balanced between vocabulary and style.
+
+Set name (context only): {set_name or "Untitled set"}
+Existing cards snapshot (avoid repeating these):
+{json.dumps(existing_preview, ensure_ascii=False)[:5000]}
+"""
+
+        r = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You output strict JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_tokens=3200,
+        )
+
+        raw = (r.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+
+        payload: Dict[str, Any] = {}
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            if match:
+                payload = json.loads(match.group(0))
+
+        rows = payload.get("cards") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            rows = []
+
+        cards: List[dict] = []
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text") or "").strip()
+            lemma = str(row.get("lemma") or "").strip()
+            annotation = str(row.get("annotation") or row.get("note") or row.get("gloss") or "").strip()
+            translation = str(row.get("translation") or "").strip()
+            if not text and not lemma and not annotation:
+                continue
+            cards.append({
+                "id": f"ai_{secrets.token_urlsafe(8)}_{idx}",
+                "text": text or lemma or annotation[:80] or "Flashcard",
+                "lemma": lemma or text,
+                "annotation": annotation or translation,
+                "translation": translation
+            })
+
+        cards = cards[:50]
+        if len(cards) < 30:
+            raise HTTPException(status_code=502, detail="AI returned too few cards")
+
+        track_server_event(
+            "autoflashcards_generated",
+            request,
+            properties={
+                "focus": focus,
+                "count": len(cards),
+                "used_pro": uses_pro,
+            },
+        )
+
+        return {
+            "cards": cards,
+            "remaining_credits": remaining,
+            "limit": FREE_AI_CREDITS,
+        }
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        print("AI ERROR (autoflashcards):", e)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
