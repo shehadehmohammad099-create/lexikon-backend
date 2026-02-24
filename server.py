@@ -644,8 +644,11 @@ class MemorizeJudgeRequest(BaseModel):
 class AutoFlashcardsRequest(BaseModel):
     focus: str = "mix"  # vocab | style | mix
     count: Optional[int] = 40
-    existing_cards: Optional[List[dict]] = []
-    set_name: Optional[str] = ""
+    work_title: Optional[str] = ""
+    section_id: Optional[str] = ""
+    section_label: Optional[str] = ""
+    passage: str
+    translation: Optional[str] = ""
 
 
 class WorkAnnotationToken(BaseModel):
@@ -1963,9 +1966,13 @@ def generate_autoflashcards(req: AutoFlashcardsRequest, request: Request):
 
         target_count = int(req.count or 40)
         target_count = max(30, min(50, target_count))
-        set_name = (req.set_name or "").strip()
-        existing_cards = req.existing_cards if isinstance(req.existing_cards, list) else []
-        existing_preview = existing_cards[:12]
+        work_title = (req.work_title or "").strip()
+        section_id = (req.section_id or "").strip()
+        section_label = (req.section_label or "").strip()
+        passage = (req.passage or "").strip()
+        translation = (req.translation or "").strip()
+        if not passage:
+            raise HTTPException(status_code=400, detail="passage required")
 
         pro = request.headers.get("X-Pro-Token")
         uses_pro = has_pro(pro)
@@ -2000,9 +2007,13 @@ Rules by focus:
 - style: mostly rhetorical/literary technique cards.
 - mix: balanced between vocabulary and style.
 
-Set name (context only): {set_name or "Untitled set"}
-Existing cards snapshot (avoid repeating these):
-{json.dumps(existing_preview, ensure_ascii=False)[:5000]}
+Work: {work_title or "Unknown work"}
+Section: {section_label or section_id or "Unknown section"}
+Passage:
+{passage[:14000]}
+
+Translation (optional reference):
+{translation[:12000]}
 """
 
         r = openai.ChatCompletion.create(
