@@ -369,12 +369,7 @@ def has_pro(pro_token: str | None) -> bool:
         return False
 
     try:
-        subs = stripe.Subscription.list(
-            customer=customer_id,
-            status="active",
-            limit=1
-        )
-        return len(subs.data) > 0
+        return stripe_customer_has_paid_access(customer_id)
     except Exception as e:
         print(f"Stripe check failed in has_pro for customer {customer_id}: {e}")
         return False
@@ -388,6 +383,34 @@ def get_anon_id(request: Request) -> str | None:
     if anon_id and anon_id.startswith("anon_"):
         return anon_id
     return None
+
+
+def stripe_price_is_recurring() -> bool:
+    try:
+        price = stripe.Price.retrieve(STRIPE_PRICE_ID)
+        return bool(price.get("recurring"))
+    except Exception as e:
+        print(f"Failed to read Stripe price metadata: {e}")
+        return True
+
+
+def stripe_customer_has_paid_access(customer_id: str | None) -> bool:
+    if not customer_id:
+        return False
+
+    if not stripe_price_is_recurring():
+        return True
+
+    try:
+        subs = stripe.Subscription.list(
+            customer=customer_id,
+            status="active",
+            limit=1
+        )
+        return len(subs.data) > 0
+    except Exception as e:
+        print(f"Stripe paid-access check failed for customer {customer_id}: {e}")
+        return False
 
 
 def maybe_reset_free_ai_credits_window(anon_id: str) -> None:
@@ -1423,6 +1446,8 @@ def create_checkout_session(request: Request, promo: Optional[str] = None):
             "success_url": f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
             "cancel_url": f"{origin}/index.html",
         }
+        if checkout_mode == "payment":
+            checkout_payload["customer_creation"] = "always"
 
         if promo_code:
             matches = stripe.PromotionCode.list(
@@ -1518,7 +1543,13 @@ def checkout_success(session_id: str, request: Request):
             expand=["customer"]
         )
 
-        customer_id = session.customer.id
+        customer = getattr(session, "customer", None)
+        if isinstance(customer, str):
+            customer_id = customer
+        elif customer is not None:
+            customer_id = getattr(customer, "id", None)
+        else:
+            customer_id = None
         email = (
             session.customer_details.email
             if session.customer_details and session.customer_details.email
@@ -1599,19 +1630,13 @@ async def request_restore(request: Request):
 
     customer = customers[0]
 
-    subs = stripe.Subscription.list(
-        customer=customer.id,
-        status="active",
-        limit=1
-    ).data
-
-    if not subs:
-        print(f"⚠️ No active subscription for {email}")
+    if not stripe_customer_has_paid_access(customer.id):
+        print(f"⚠️ No paid access found for {email}")
         track_server_event(
             "billing_restore_requested",
             request,
             customer_id=customer.id,
-            properties={"status": "no_active_subscription"},
+            properties={"status": "no_paid_access"},
         )
         return {"ok": True}
 
@@ -1663,20 +1688,14 @@ async def restore_from_link(request: Request):
 
         customer_id = row["customer_id"]
 
-        subs = stripe.Subscription.list(
-            customer=customer_id,
-            status="active",
-            limit=1
-        ).data
-
-        if not subs:
+        if not stripe_customer_has_paid_access(customer_id):
             track_server_event(
                 "billing_restore_link_used",
                 request,
                 customer_id=customer_id,
-                properties={"status": "no_active_subscription"},
+                properties={"status": "no_paid_access"},
             )
-            raise HTTPException(status_code=402, detail="No active subscription")
+            raise HTTPException(status_code=402, detail="No paid access found")
 
         pro_token = secrets.token_urlsafe(32)
 
@@ -1721,9 +1740,8 @@ def billing_restore_token(session_id: str):
     if not customer_id:
         raise HTTPException(status_code=400, detail="No customer on session")
 
-    subs = stripe.Subscription.list(customer=customer_id, status="active", limit=1)
-    if not subs.data:
-        raise HTTPException(status_code=402, detail="No active subscription")
+    if not stripe_customer_has_paid_access(customer_id):
+        raise HTTPException(status_code=402, detail="No paid access found")
 
     token = secrets.token_urlsafe(32)
 
@@ -3775,14 +3793,8 @@ def restore_pro(session_id: str):
     if not customer_id:
         raise HTTPException(status_code=400, detail="No customer")
 
-    subs = stripe.Subscription.list(
-        customer=customer_id,
-        status="active",
-        limit=1
-    )
-
-    if not subs.data:
-        raise HTTPException(status_code=402, detail="No active subscription")
+    if not stripe_customer_has_paid_access(customer_id):
+        raise HTTPException(status_code=402, detail="No paid access found")
 
     token = secrets.token_urlsafe(32)
 
@@ -3827,7 +3839,7 @@ def require_pro_user(request: Request, allow_inactive: bool = False) -> str:
         return customer_id
 
     if not has_pro(token):
-        raise HTTPException(status_code=402, detail="No active subscription")
+        raise HTTPException(status_code=402, detail="No paid access found")
 
     return customer_id
 
