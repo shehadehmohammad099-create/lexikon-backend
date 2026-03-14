@@ -2055,7 +2055,39 @@ def generate_autoflashcards(req: AutoFlashcardsRequest, request: Request):
         if not uses_pro:
             remaining = consume_free_ai_credits(request, 2)
 
-        prompt = f"""
+        def build_prompt(strict_style: bool = False) -> str:
+            focus_rules = """
+Rules by focus:
+- vocab: mostly vocabulary meaning + usage.
+- style: every card must be a rhetorical/literary/language technique card, not a single-word vocab card.
+- mix: balanced between vocabulary and style.
+"""
+            style_rules = ""
+            if focus == "style":
+                style_rules = """
+
+Style-card requirements:
+- The front of each card must be the name of a style/rhetorical/language technique, for example: alliteration, asyndeton, tricolon, hyperbaton, chiasmus, homoeoteleuton, anaphora, vivid historic present.
+- Do not use a Latin/Greek word or lemma as the front of a style card unless it is part of the quoted example on the back.
+- The back of each card must include:
+  1. a short quoted example from the passage,
+  2. what the technique is doing in that example,
+  3. why it matters in context or what effect it creates.
+- Good shape:
+  text = "Homoeoteleuton"
+  annotation = "\\"addulant appellitant\\" repeats matching endings, making the pair sound patterned and insistent; this sharpens the sense of busy, repeated action."
+- Bad shape:
+  text = "addulant"
+  annotation = "they bring"
+"""
+                if strict_style:
+                    style_rules += """
+- This is a correction pass because the previous output was not style-focused enough.
+- Every returned card must satisfy the style-card requirements above.
+- If unsure, prefer a clearly named technique with a brief quoted example and effect.
+"""
+
+            return f"""
 You are generating flashcards for a classical-languages revision app.
 
 Task:
@@ -2077,10 +2109,8 @@ Output format:
   ]
 }}
 
-Rules by focus:
-- vocab: mostly vocabulary meaning + usage.
-- style: mostly rhetorical/literary technique cards.
-- mix: balanced between vocabulary and style.
+{focus_rules}
+{style_rules}
 
 Work: {work_title or "Unknown work"}
 Section: {section_label or section_id or "Unknown section"}
@@ -2091,46 +2121,90 @@ Translation (optional reference):
 {translation[:12000]}
 """
 
+        def parse_cards(raw: str) -> List[dict]:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+            payload: Dict[str, Any] = {}
+            try:
+                payload = json.loads(cleaned)
+            except Exception:
+                match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+                if match:
+                    payload = json.loads(match.group(0))
+
+            rows = payload.get("cards") if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                rows = []
+
+            parsed_cards: List[dict] = []
+            for idx, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("text") or "").strip()
+                lemma = str(row.get("lemma") or "").strip()
+                annotation = str(row.get("annotation") or row.get("note") or row.get("gloss") or row.get("back") or "").strip()
+                translation = str(row.get("translation") or "").strip()
+                if not text and not lemma and not annotation:
+                    continue
+                parsed_cards.append({
+                    "id": f"ai_{secrets.token_urlsafe(8)}_{idx}",
+                    "text": text or lemma or annotation[:80] or "Flashcard",
+                    "lemma": lemma or text,
+                    "annotation": annotation or translation,
+                    "translation": translation
+                })
+            return parsed_cards[:50]
+
+        def count_style_shaped_cards(cards: List[dict]) -> int:
+            style_keywords = {
+                "alliteration", "assonance", "anaphora", "polyptoton", "polysyndeton",
+                "asyndeton", "hyperbaton", "chiasmus", "tricolon", "litotes",
+                "metaphor", "simile", "personification", "enjambment", "caesura",
+                "homoeoteleuton", "homioteleuton", "allusion", "apostrophe", "antithesis",
+                "onomatopoeia", "sibilance", "word order", "historic present", "imagery",
+                "repetition", "contrast", "sound pattern", "rhetorical question",
+                "direct address", "enjambement", "parallelism", "ring composition"
+            }
+            count = 0
+            for card in cards:
+                front = str(card.get("text") or "").strip().lower()
+                back = str(card.get("annotation") or "").strip()
+                if any(keyword in front for keyword in style_keywords) and ("\"" in back or "'" in back or "effect" in back.lower() or "emphas" in back.lower()):
+                    count += 1
+            return count
+
         raw = claude_complete(
             system_prompt="You output strict JSON only.",
-            user_prompt=prompt,
+            user_prompt=build_prompt(strict_style=False),
             temperature=0.5,
             max_tokens=3200,
         ).strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+        cards = parse_cards(raw)
 
-        payload: Dict[str, Any] = {}
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-            if match:
-                payload = json.loads(match.group(0))
+        if focus == "style":
+            style_count = count_style_shaped_cards(cards)
+            minimum_style_cards = max(24, int(target_count * 0.8))
+            if len(cards) < 30 or style_count < minimum_style_cards:
+                retry_raw = claude_complete(
+                    system_prompt="You output strict JSON only.",
+                    user_prompt=build_prompt(strict_style=True),
+                    temperature=0.4,
+                    max_tokens=3200,
+                ).strip()
+                retry_cards = parse_cards(retry_raw)
+                retry_style_count = count_style_shaped_cards(retry_cards)
+                if len(retry_cards) >= 30 and (
+                    retry_style_count > style_count or
+                    (retry_style_count == style_count and len(retry_cards) > len(cards))
+                ):
+                    cards = retry_cards
+                    style_count = retry_style_count
 
-        rows = payload.get("cards") if isinstance(payload, dict) else []
-        if not isinstance(rows, list):
-            rows = []
+            if style_count < minimum_style_cards:
+                raise HTTPException(status_code=502, detail="AI did not return enough style-focused cards")
 
-        cards: List[dict] = []
-        for idx, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            text = str(row.get("text") or "").strip()
-            lemma = str(row.get("lemma") or "").strip()
-            annotation = str(row.get("annotation") or row.get("note") or row.get("gloss") or "").strip()
-            translation = str(row.get("translation") or "").strip()
-            if not text and not lemma and not annotation:
-                continue
-            cards.append({
-                "id": f"ai_{secrets.token_urlsafe(8)}_{idx}",
-                "text": text or lemma or annotation[:80] or "Flashcard",
-                "lemma": lemma or text,
-                "annotation": annotation or translation,
-                "translation": translation
-            })
-
-        cards = cards[:50]
         if len(cards) < 30:
             raise HTTPException(status_code=502, detail="AI returned too few cards")
 
