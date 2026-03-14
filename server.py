@@ -2,7 +2,6 @@ import os
 import secrets
 import hashlib
 import stripe
-import openai
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, quote
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
@@ -325,7 +324,9 @@ app.add_middleware(
 # -------------------------
 # ENV
 # -------------------------
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 FRONTEND_URL = os.environ["FRONTEND_URL"]
@@ -337,13 +338,57 @@ POSTHOG_PROJECT_API_KEY = (
 )
 POSTHOG_API_HOST = (os.environ.get("POSTHOG_API_HOST") or "https://us.i.posthog.com").rstrip("/")
 
-openai.api_key = OPENAI_API_KEY
 stripe.api_key = STRIPE_SECRET_KEY
 
 
 # -------------------------
 # HELPERS
 # -------------------------
+
+def claude_complete(system_prompt: str, user_prompt: str, temperature: float = 0.3, max_tokens: int = 1024) -> str:
+    """Send a text generation request to Anthropic Claude and return plain text."""
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": CLAUDE_MODEL,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=90,
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Claude request failed: {e}") from e
+
+    if not res.ok:
+        detail = ""
+        try:
+            data = res.json()
+            detail = data.get("error", {}).get("message") or data.get("message") or res.text
+        except Exception:
+            detail = res.text
+        raise HTTPException(status_code=502, detail=f"Claude request failed: {detail}")
+
+    data = res.json()
+    content = data.get("content") or []
+    text_parts = [
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    ]
+    text = "".join(text_parts).strip()
+    if not text:
+        raise HTTPException(status_code=502, detail="Claude returned empty content")
+    return text
 
 def customer_from_token(pro_token: str | None):
     if not pro_token:
@@ -1045,17 +1090,12 @@ Source excerpt:
 {source_text}
 """
 
-    r = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a classical philologist and podcast writer."},
-            {"role": "user", "content": prompt}
-        ],
+    script = sanitize_podcast_script(claude_complete(
+        system_prompt="You are a classical philologist and podcast writer.",
+        user_prompt=prompt,
         temperature=0.65,
         max_tokens=min(4200, max(2400, target_minutes * 220)),
-    )
-
-    script = sanitize_podcast_script(r.choices[0].message.content.strip())
+    ))
     words = count_script_words(script)
     if words >= min_words:
         return script
@@ -1070,16 +1110,12 @@ Add about {deficit} more words.
 Existing script:
 {script}
 """
-    r2 = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a classical philologist and podcast writer."},
-            {"role": "user", "content": expand_prompt}
-        ],
+    continuation = sanitize_podcast_script(claude_complete(
+        system_prompt="You are a classical philologist and podcast writer.",
+        user_prompt=expand_prompt,
         temperature=0.55,
         max_tokens=min(2400, max(900, deficit * 2)),
-    )
-    continuation = sanitize_podcast_script(r2.choices[0].message.content.strip())
+    ))
     joined = f"{script}\n{continuation}".strip()
     return sanitize_podcast_script(joined)
 
@@ -1157,6 +1193,8 @@ def split_dialogue(script: str) -> List[dict]:
 
 def generate_podcast_audio(script: str, voice: str = "alloy", model: str = "tts-1", voices: Optional[List[str]] = None):
     """Generate TTS audio bytes and estimated transcript timings."""
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set for podcast audio generation")
     url = "https://api.openai.com/v1/audio/speech"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -1913,17 +1951,12 @@ Return strict JSON only with these keys:
 - reason: short one-sentence explanation (max 20 words)
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a strict semantic grader."},
-                {"role": "user", "content": prompt}
-            ],
+        raw = claude_complete(
+            system_prompt="You are a strict semantic grader.",
+            user_prompt=prompt,
             temperature=0.1,
             max_tokens=180,
-        )
-
-        raw = (r.choices[0].message.content or "").strip()
+        ).strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
 
@@ -2056,17 +2089,12 @@ Translation (optional reference):
 {translation[:12000]}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You output strict JSON only."},
-                {"role": "user", "content": prompt}
-            ],
+        raw = claude_complete(
+            system_prompt="You output strict JSON only.",
+            user_prompt=prompt,
             temperature=0.5,
             max_tokens=3200,
-        )
-
-        raw = (r.choices[0].message.content or "").strip()
+        ).strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
 
@@ -2161,18 +2189,13 @@ Context word/phrase: {req.sentence}
 {memory_block}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a classical philologist."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=300,
-        )
-
         return {
-            "explanation": r.choices[0].message.content.strip(),
+            "explanation": claude_complete(
+                system_prompt="You are a classical philologist.",
+                user_prompt=prompt,
+                temperature=0.3,
+                max_tokens=300,
+            ).strip(),
             "remaining_credits": remaining,
             "limit": FREE_AI_CREDITS
         }
@@ -2237,18 +2260,13 @@ Work B: {b.work_title} {b.section_label}
 {memory_block}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a classical philologist."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=320,
-        )
-
         return {
-            "explanation": r.choices[0].message.content.strip(),
+            "explanation": claude_complete(
+                system_prompt="You are a classical philologist.",
+                user_prompt=prompt,
+                temperature=0.3,
+                max_tokens=320,
+            ).strip(),
             "remaining_credits": remaining,
             "limit": FREE_AI_CREDITS
         }
@@ -2299,18 +2317,13 @@ Translation (for reference only):
 {memory_block}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a classical philologist."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=500,
-        )
-
         return {
-            "explanation": r.choices[0].message.content.strip(),
+            "explanation": claude_complete(
+                system_prompt="You are a classical philologist.",
+                user_prompt=prompt,
+                temperature=0.3,
+                max_tokens=500,
+            ).strip(),
             "remaining_credits": remaining,
             "limit": FREE_AI_CREDITS
         }
@@ -2398,17 +2411,12 @@ Passage:
 {passage[:12000]}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a careful A-Level/GCSE classics examiner."},
-                {"role": "user", "content": prompt}
-            ],
+        question = claude_complete(
+            system_prompt="You are a careful A-Level/GCSE classics examiner.",
+            user_prompt=prompt,
             temperature=0.35,
             max_tokens=220,
-        )
-
-        question = (r.choices[0].message.content or "").strip()
+        ).strip()
         return {
             "question": question,
             "remaining_credits": remaining,
@@ -2539,17 +2547,12 @@ Student answer:
 {user_answer[:12000]}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a rigorous examiner who gives precise feedback."},
-                {"role": "user", "content": prompt}
-            ],
+        feedback = claude_complete(
+            system_prompt="You are a rigorous examiner who gives precise feedback.",
+            user_prompt=prompt,
             temperature=0.2,
             max_tokens=700,
-        )
-
-        feedback = (r.choices[0].message.content or "").strip()
+        ).strip()
         return {
             "feedback": feedback,
             "remaining_credits": remaining,
@@ -2633,17 +2636,12 @@ Examiner feedback to address:
 {feedback[:5000]}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a precise classics tutor who rewrites answers to stronger exam bands."},
-                {"role": "user", "content": prompt}
-            ],
+        improved_answer = claude_complete(
+            system_prompt="You are a precise classics tutor who rewrites answers to stronger exam bands.",
+            user_prompt=prompt,
             temperature=0.35,
             max_tokens=900,
-        )
-
-        improved_answer = (r.choices[0].message.content or "").strip()
+        ).strip()
         return {
             "improved_answer": improved_answer,
             "remaining_credits": remaining,
@@ -2765,17 +2763,12 @@ Sections provided: {len(normalized_sections)}
 {memory_block}
 """
 
-        r = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a precise, concise classical philologist."},
-                {"role": "user", "content": prompt}
-            ],
+        raw = claude_complete(
+            system_prompt="You are a precise, concise classical philologist.",
+            user_prompt=prompt,
             temperature=0.2,
             max_tokens=1500,
-        )
-
-        raw = (r.choices[0].message.content or "").strip()
+        ).strip()
         parsed = None
         try:
             parsed = json.loads(raw)
@@ -2928,16 +2921,12 @@ Rules:
 {chr(10).join(fallback_blocks)}
 """
                 try:
-                    rf = openai.ChatCompletion.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": "You are a precise classical philologist."},
-                            {"role": "user", "content": fallback_prompt}
-                        ],
+                    raw_lines = claude_complete(
+                        system_prompt="You are a precise classical philologist.",
+                        user_prompt=fallback_prompt,
                         temperature=0.1,
                         max_tokens=500,
-                    )
-                    raw_lines = (rf.choices[0].message.content or "").strip().splitlines()
+                    ).strip().splitlines()
                     for line in raw_lines:
                         parts = [p.strip() for p in line.split("|", 2)]
                         if len(parts) != 3:
