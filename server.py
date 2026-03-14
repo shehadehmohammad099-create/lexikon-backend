@@ -647,6 +647,7 @@ class ExplainPassage(BaseModel):
 
 class ExamQuestionRequest(BaseModel):
     level: str
+    marks: Optional[int] = 20
     focus: str
     work_title: Optional[str] = ""
     section_id: Optional[str] = ""
@@ -656,6 +657,7 @@ class ExamQuestionRequest(BaseModel):
 
 class ExamMarkRequest(BaseModel):
     level: str
+    marks: Optional[int] = 20
     focus: str
     work_title: Optional[str] = ""
     section_id: Optional[str] = ""
@@ -667,6 +669,7 @@ class ExamMarkRequest(BaseModel):
 
 class ExamFixRequest(BaseModel):
     level: str
+    marks: Optional[int] = 20
     focus: str
     work_title: Optional[str] = ""
     section_id: Optional[str] = ""
@@ -2345,11 +2348,18 @@ def generate_exam_question(request: Request, req: Dict[str, Any] = Body(default_
         work_title = as_text(req.get("work_title", req.get("workTitle", req.get("work", ""))))
         section_id = as_text(req.get("section_id", req.get("sectionId", "")))
         section_label = as_text(req.get("section_label", req.get("sectionLabel", "")))
+        marks_raw = req.get("marks", req.get("mark", req.get("marks_total", 20)))
+        try:
+            marks = int(marks_raw)
+        except (TypeError, ValueError):
+            marks = 20
 
         if level not in {"gcse", "a-level", "a_level"}:
             raise HTTPException(status_code=400, detail="Invalid level")
         if focus not in {"ao3_style", "ao2_knowledge", "balanced"}:
             raise HTTPException(status_code=400, detail="Invalid focus")
+        if marks not in {5, 20}:
+            raise HTTPException(status_code=400, detail="Invalid marks")
         if not passage:
             raise HTTPException(status_code=400, detail="passage required")
 
@@ -2371,7 +2381,10 @@ Create exactly one question based only on the passage provided.
 
 Requirements:
 - Question must explicitly reference details in the passage.
+- The question must clearly fit a {marks}-mark response.
 - Match this focus: {focus_label}.
+- If 5 marks: ask for a concise, tightly focused response on a small number of clear points from the passage.
+- If 20 marks: ask for a full evaluative essay-style response.
 - If AO3 style-heavy: prioritize literary style/rhetoric/tone/authorial method.
 - If AO2 knowledge-heavy: prioritize understanding, argument/content, and evidence use.
 - If balanced: include both style and knowledge demands.
@@ -2416,6 +2429,7 @@ def mark_exam_question(req: ExamMarkRequest, request: Request):
     try:
         level = (req.level or "").strip().lower()
         focus = (req.focus or "").strip().lower()
+        marks = int(req.marks or 20)
         passage = (req.passage or "").strip()
         question = (req.question or "").strip()
         user_answer = (req.user_answer or "").strip()
@@ -2424,6 +2438,8 @@ def mark_exam_question(req: ExamMarkRequest, request: Request):
             raise HTTPException(status_code=400, detail="Invalid level")
         if focus not in {"ao3_style", "ao2_knowledge", "balanced"}:
             raise HTTPException(status_code=400, detail="Invalid focus")
+        if marks not in {5, 20}:
+            raise HTTPException(status_code=400, detail="Invalid marks")
         if not passage:
             raise HTTPException(status_code=400, detail="passage required")
         if not question:
@@ -2443,7 +2459,48 @@ def mark_exam_question(req: ExamMarkRequest, request: Request):
         if not has_pro(pro):
             remaining = consume_free_ai_credit(request)
 
-        prompt = f"""
+        if marks == 5:
+            prompt = f"""
+You are a strict but fair classics examiner.
+Critically mark this student's 5-mark answer for {normalized_level} using the requested focus: {focus_label}.
+
+Produce feedback that is clear, specific, and evidence-led.
+Output plain text only with this structure:
+Overall mark: X/5
+Judgement: one short line
+What works:
+- ...
+- ...
+What to improve:
+- ...
+- ...
+PEE check:
+- Point 1: secure or missing
+- Evidence/explanation 1: secure or missing
+- Point 2: secure or missing
+- Evidence/explanation 2: secure or missing
+Rewrite target:
+- one short actionable sentence
+
+Marking guidance:
+- Judge the answer on a concise Point, Evidence, Explanation structure.
+- Expect roughly: point, evidence/explanation, point, evidence/explanation.
+- Reward direct reference to the passage and clear explanation of effect.
+- Be candid. Do not inflate marks.
+
+Work: {req.work_title}
+Section: {req.section_label or req.section_id}
+Question:
+{question}
+
+Passage:
+{passage[:12000]}
+
+Student answer:
+{user_answer[:12000]}
+"""
+        else:
+            prompt = f"""
 You are a strict but fair classics examiner.
 Critically mark the student answer for {normalized_level} using the requested focus: {focus_label}.
 
@@ -2512,6 +2569,7 @@ Student answer:
 def fix_exam_answer(req: ExamFixRequest, request: Request):
     try:
         level = (req.level or "").strip().lower()
+        marks = int(req.marks or 20)
         focus = (req.focus or "").strip().lower()
         passage = (req.passage or "").strip()
         question = (req.question or "").strip()
@@ -2522,6 +2580,8 @@ def fix_exam_answer(req: ExamFixRequest, request: Request):
             raise HTTPException(status_code=400, detail="Invalid level")
         if focus not in {"ao3_style", "ao2_knowledge", "balanced"}:
             raise HTTPException(status_code=400, detail="Invalid focus")
+        if marks not in {5, 20}:
+            raise HTTPException(status_code=400, detail="Invalid marks")
         if not passage:
             raise HTTPException(status_code=400, detail="passage required")
         if not question:
@@ -2545,12 +2605,14 @@ def fix_exam_answer(req: ExamFixRequest, request: Request):
 
         prompt = f"""
 You are improving a student's classics exam answer to a higher band while preserving its original argument.
-Rewrite the answer for {normalized_level} with this focus: {focus_label}.
+Rewrite the answer for {normalized_level} with this focus: {focus_label}. This is a {marks}-mark response.
 
 Rules:
 - Keep the student's core claim and intent.
 - Raise analytical quality, precision, and evidence use.
 - Integrate stronger AO2 and AO3 reasoning where relevant.
+- If 5 marks: keep it concise and tightly structured around point, evidence, explanation, point, evidence/explanation.
+- If 20 marks: keep the fuller essay-style development.
 - Use concise paragraphing.
 - Keep the answer realistic for a student under exam conditions.
 - Do not add headings, bullet points, or meta commentary.
