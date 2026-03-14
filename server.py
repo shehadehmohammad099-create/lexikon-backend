@@ -326,7 +326,7 @@ app.add_middleware(
 # -------------------------
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-0")
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 FRONTEND_URL = os.environ["FRONTEND_URL"]
@@ -355,7 +355,7 @@ def claude_complete(system_prompt: str, user_prompt: str, temperature: float = 0
     payload = {
         "model": CLAUDE_MODEL,
         "system": system_prompt,
-        "messages": [{"role": "user", "content": user_prompt}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": user_prompt}]}],
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
@@ -376,7 +376,9 @@ def claude_complete(system_prompt: str, user_prompt: str, temperature: float = 0
             detail = data.get("error", {}).get("message") or data.get("message") or res.text
         except Exception:
             detail = res.text
-        raise HTTPException(status_code=502, detail=f"Claude request failed: {detail}")
+        print(f"Claude API error status={res.status_code} model={CLAUDE_MODEL} detail={detail}")
+        upstream_status = res.status_code if res.status_code in {400, 401, 403, 404, 413, 429, 500, 529} else 502
+        raise HTTPException(status_code=upstream_status, detail=f"Claude request failed: {detail}")
 
     data = res.json()
     content = data.get("content") or []
