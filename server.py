@@ -854,6 +854,7 @@ class ExplainWord(BaseModel):
     sentence: str
     speaker: str | None = ""
     work: str | None = ""
+    language: Optional[str] = ""
     prompt_memory: Optional[str] = ""
 
 
@@ -863,6 +864,7 @@ class ExplainPassage(BaseModel):
     speaker: Optional[str] = ""
     greek: str
     translation: Optional[str] = ""
+    language: Optional[str] = ""
     prompt_memory: Optional[str] = ""
 
 
@@ -957,6 +959,171 @@ class ExplainLink(BaseModel):
     to_word: LinkWord = Field(..., alias="to")
     link_note: Optional[str] = ""
     prompt_memory: Optional[str] = ""
+
+
+def detect_text_family(*values: Optional[str]) -> str:
+    sample = " ".join(str(value or "") for value in values).strip()
+    lowered = sample.lower()
+    if not sample:
+        return "general"
+    if re.search(r"[\u0370-\u03FF\u1F00-\u1FFF]", sample):
+        return "greek"
+    if "ancient greek" in lowered or re.search(r"\bgreek\b", lowered):
+        return "greek"
+    if "latin" in lowered or re.search(r"\bla\b", lowered):
+        return "latin"
+    return "general"
+
+
+def build_explain_word_prompt(req: ExplainWord, memory_block: str) -> tuple[str, str]:
+    family = detect_text_family(req.language, req.token, req.lemma, req.sentence, req.work)
+    if family in {"greek", "latin"}:
+        prompt = f"""
+You are a classical languages tutor. Give a concise, pointed coaching note (not an info dump).
+Goal: help a student see the key grammatical cue and how it fits the sentence; then suggest a quick follow-up question.
+Be brief (4-6 sentences max).
+Include:
+- What the form tells us (lemma, POS, morphology).
+- One or two likely syntactic roles.
+- One micro-question to check understanding.
+Word: {req.token}
+Lemma: {req.lemma}
+POS: {req.pos}
+Morphology: {req.morph}
+Context word/phrase: {req.sentence}
+Work: {req.work}
+Language hint: {req.language}
+{memory_block}
+"""
+        return "You are a classical philologist.", prompt
+
+    prompt = f"""
+You are a close-reading tutor. Give a concise, pointed explanation of how this word or phrase works in context.
+Be brief (4-6 sentences max).
+Focus on:
+- the word's basic sense or function in this sentence,
+- any useful grammar, diction, tone, or stylistic effect,
+- one quick follow-up question to check understanding.
+Do not say the text is a mix-up or complain that it is not Greek or Latin.
+Word: {req.token}
+Lemma/base form: {req.lemma}
+POS: {req.pos}
+Morphology/grammar notes: {req.morph}
+Context word/phrase: {req.sentence}
+Work: {req.work}
+Language hint: {req.language}
+{memory_block}
+"""
+    return "You are a precise literature and language tutor.", prompt
+
+
+def build_explain_link_prompt(req: ExplainLink, memory_block: str, link_note_block: str) -> tuple[str, str]:
+    a = req.from_word
+    b = req.to_word
+    family = detect_text_family(
+        a.token, a.lemma, a.sentence, a.work_title,
+        b.token, b.lemma, b.sentence, b.work_title,
+    )
+    if family in {"greek", "latin"}:
+        prompt = f"""
+You are a classical languages tutor. The student linked two words and wants a brief explanation of the link.
+Be concise (4-6 sentences). Focus on:
+- What each form tells us (lemma, POS, morphology).
+- How the two words relate (syntactic, semantic, thematic, or rhetorical).
+- One quick check-for-understanding question.
+
+Word A: {a.token}
+Lemma A: {a.lemma}
+POS A: {a.pos}
+Morph A: {a.morph}
+Context A: {a.sentence}
+Work A: {a.work_title} {a.section_label}
+
+Word B: {b.token}
+Lemma B: {b.lemma}
+POS B: {b.pos}
+Morph B: {b.morph}
+Context B: {b.sentence}
+Work B: {b.work_title} {b.section_label}
+{link_note_block}
+{memory_block}
+"""
+        return "You are a classical philologist.", prompt
+
+    prompt = f"""
+You are a close-reading tutor. The student linked two words or phrases and wants a brief explanation of the connection.
+Be concise (4-6 sentences). Focus on:
+- what each word or phrase contributes in context,
+- how they relate semantically, structurally, or rhetorically,
+- one quick check-for-understanding question.
+Do not say the text is a mix-up or complain that it is not Greek or Latin.
+
+Word A: {a.token}
+Lemma/base form A: {a.lemma}
+POS A: {a.pos}
+Grammar notes A: {a.morph}
+Context A: {a.sentence}
+Work A: {a.work_title} {a.section_label}
+
+Word B: {b.token}
+Lemma/base form B: {b.lemma}
+POS B: {b.pos}
+Grammar notes B: {b.morph}
+Context B: {b.sentence}
+Work B: {b.work_title} {b.section_label}
+{link_note_block}
+{memory_block}
+"""
+    return "You are a precise literature and language tutor.", prompt
+
+
+def build_explain_passage_prompt(req: ExplainPassage, memory_block: str) -> tuple[str, str]:
+    family = detect_text_family(req.language, req.greek, req.work)
+    if family in {"greek", "latin"}:
+        prompt = f"""
+You are a classical languages tutor. Give a short, structured walkthrough to help a student read the passage (not a summary).
+Keep it to 5-8 sentences. Focus on:
+- Sentence spine: finite verbs and clauses (who does what).
+- Two or three tricky constructions or particles to watch.
+- One quick check-for-understanding question at the end.
+Avoid paraphrase; stay on syntax and how to navigate it.
+
+Work: {req.work}
+Section: {req.section}
+Speaker: {req.speaker}
+Language hint: {req.language}
+
+Source text:
+{req.greek}
+
+Translation (for reference only):
+{req.translation}
+{memory_block}
+"""
+        return "You are a classical philologist.", prompt
+
+    prompt = f"""
+You are a close-reading tutor. Give a short, structured explanation to help a student understand how this passage works.
+Keep it to 5-8 sentences. Focus on:
+- the sentence or thought structure,
+- two or three important diction, tone, imagery, or rhetorical features,
+- one quick check-for-understanding question at the end.
+Do not say the text is a mix-up or complain that it is not Greek or Latin.
+Avoid plot summary unless it directly supports the explanation.
+
+Work: {req.work}
+Section: {req.section}
+Speaker: {req.speaker}
+Language hint: {req.language}
+
+Source text:
+{req.greek}
+
+Translation/reference text:
+{req.translation}
+{memory_block}
+"""
+    return "You are a precise literature and language tutor.", prompt
 
 
 class SaveTextConnection(BaseModel):
@@ -2500,25 +2667,11 @@ Student saved annotations (prompt memory):
 Use this as supporting context when helpful, but prioritize the source text and morphology.
 """
 
-        prompt = f"""
-You are a classical languages tutor. Give a concise, pointed coaching note (not an info dump).
-Goal: help a student see the key grammatical cue and how it fits the sentence; then suggest a quick follow-up question.
-Be brief (4-6 sentences max).
-Include:
-- What the form tells us (lemma, POS, morphology).
-- One or two likely syntactic roles.
-- One micro-question to check understanding.
-Word: {req.token}
-Lemma: {req.lemma}
-POS: {req.pos}
-Morphology: {req.morph}
-Context word/phrase: {req.sentence}
-{memory_block}
-"""
+        system_prompt, prompt = build_explain_word_prompt(req, memory_block)
 
         return {
             "explanation": claude_complete(
-                system_prompt="You are a classical philologist.",
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 temperature=0.3,
                 max_tokens=300,
@@ -2563,33 +2716,11 @@ Student link note:
 {link_note}
 """
 
-        prompt = f"""
-You are a classical languages tutor. The student linked two words and wants a brief explanation of the link.
-Be concise (4-6 sentences). Focus on:
-- What each form tells us (lemma, POS, morphology).
-- How the two words relate (syntactic, semantic, thematic, or rhetorical).
-- One quick check-for-understanding question.
-
-Word A: {a.token}
-Lemma A: {a.lemma}
-POS A: {a.pos}
-Morph A: {a.morph}
-Context A: {a.sentence}
-Work A: {a.work_title} {a.section_label}
-
-Word B: {b.token}
-Lemma B: {b.lemma}
-POS B: {b.pos}
-Morph B: {b.morph}
-Context B: {b.sentence}
-Work B: {b.work_title} {b.section_label}
-{link_note_block}
-{memory_block}
-"""
+        system_prompt, prompt = build_explain_link_prompt(req, memory_block, link_note_block)
 
         return {
             "explanation": claude_complete(
-                system_prompt="You are a classical philologist.",
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 temperature=0.3,
                 max_tokens=320,
@@ -2624,29 +2755,11 @@ Student saved annotations (prompt memory):
 Use this as supporting context when helpful, but prioritize the source text and syntax.
 """
 
-        prompt = f"""
-You are a classical languages tutor. Give a short, structured walkthrough to help a student read the passage (not a summary).
-Keep it to 5-8 sentences. Focus on:
-- Sentence spine: finite verbs and clauses (who does what).
-- Two or three tricky constructions or particles to watch.
-- One quick check-for-understanding question at the end.
-Avoid paraphrase; stay on syntax and how to navigate it.
-
-Work: {req.work}
-Section: {req.section}
-Speaker: {req.speaker}
-
-Greek text:
-{req.greek}
-
-Translation (for reference only):
-{req.translation}
-{memory_block}
-"""
+        system_prompt, prompt = build_explain_passage_prompt(req, memory_block)
 
         return {
             "explanation": claude_complete(
-                system_prompt="You are a classical philologist.",
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 temperature=0.3,
                 max_tokens=500,
