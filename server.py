@@ -320,8 +320,14 @@ def init_db():
           student_anon_id TEXT,
           student_pro_token TEXT,
           submitted_at TIMESTAMP DEFAULT NOW(),
+          marked_at TIMESTAMP,
           status TEXT DEFAULT 'submitted' CHECK (status IN ('submitted', 'marked'))
         )
+        """)
+
+        cur.execute("""
+        ALTER TABLE assignment_submissions
+        ADD COLUMN IF NOT EXISTS marked_at TIMESTAMP
         """)
 
         cur.execute("""
@@ -381,6 +387,21 @@ def init_db():
         cur.execute("""
         CREATE INDEX IF NOT EXISTS shared_resources_class_idx
         ON shared_resources (class_id, created_at DESC)
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS class_announcements (
+          id SERIAL PRIMARY KEY,
+          class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE,
+          teacher_token TEXT NOT NULL,
+          message TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT NOW()
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS class_announcements_class_idx
+        ON class_announcements (class_id, created_at DESC)
         """)
 
         cur.execute("""
@@ -1283,6 +1304,11 @@ class SharedResourceCreateRequest(BaseModel):
     token_text: Optional[str] = ""
     content: str
     model_answer: Optional[str] = ""
+
+
+class TeacherAnnouncementCreateRequest(BaseModel):
+    class_id: int
+    message: str
 
 
 class StudentJoinClassRequest(BaseModel):
@@ -4416,6 +4442,98 @@ def assignment_questions_for_ids(cur, assignment_ids: List[int]) -> Dict[int, Li
     return grouped
 
 
+def assignment_stats(cur, assignment_id: int) -> dict:
+    cur.execute(
+        """
+        SELECT
+          a.id,
+          a.class_id,
+          a.type,
+          a.due_date,
+          COUNT(DISTINCT cm.id) AS total_students,
+          COUNT(DISTINCT s.id) AS submitted_count,
+          COUNT(DISTINCT s.id) FILTER (WHERE s.status = 'marked') AS marked_count,
+          COUNT(DISTINCT cm.id) FILTER (
+            WHERE
+              a.due_date IS NOT NULL
+              AND a.due_date < NOW()
+              AND (
+                s.id IS NULL
+                OR s.submitted_at > a.due_date
+              )
+          ) AS overdue_count,
+          AVG(score_bundle.total_awarded) FILTER (
+            WHERE s.status = 'marked' AND score_bundle.total_available > 0
+          ) AS average_score,
+          MAX(score_bundle.total_available) AS max_score
+        FROM assignments a
+        LEFT JOIN class_memberships cm ON cm.class_id = a.class_id
+        LEFT JOIN assignment_submissions s
+          ON s.assignment_id = a.id
+         AND (
+            (cm.pro_token IS NOT NULL AND s.student_pro_token = cm.pro_token)
+            OR
+            (cm.anon_id IS NOT NULL AND s.student_anon_id = cm.anon_id)
+         )
+        LEFT JOIN LATERAL (
+          SELECT
+            COALESCE(SUM(sa.marks_awarded), 0) AS total_awarded,
+            COALESCE(SUM(aq.marks), 0) AS total_available
+          FROM submission_answers sa
+          LEFT JOIN assignment_questions aq ON aq.id = sa.question_id
+          WHERE sa.submission_id = s.id
+        ) AS score_bundle ON TRUE
+        WHERE a.id = %s
+        GROUP BY a.id
+        """,
+        (assignment_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    return {
+        "total_students": int(row.get("total_students") or 0),
+        "submitted_count": int(row.get("submitted_count") or 0),
+        "marked_count": int(row.get("marked_count") or 0),
+        "overdue_count": int(row.get("overdue_count") or 0),
+        "average_score": float(row["average_score"]) if row.get("average_score") is not None else None,
+        "max_score": int(row.get("max_score") or 0),
+    }
+
+
+def list_announcements_for_student(cur, identity: Dict[str, Optional[str]]) -> List[dict]:
+    cur.execute(
+        """
+        SELECT DISTINCT
+          ca.id,
+          ca.class_id,
+          c.name AS class_name,
+          ca.teacher_token,
+          ca.message,
+          ca.created_at
+        FROM class_announcements ca
+        JOIN classes c ON c.id = ca.class_id
+        JOIN class_memberships cm ON cm.class_id = c.id
+        WHERE (
+          (%s IS NOT NULL AND cm.pro_token = %s)
+          OR
+          (%s IS NOT NULL AND cm.anon_id = %s)
+        )
+        ORDER BY ca.created_at DESC, ca.id DESC
+        """,
+        (
+            identity["pro_token"],
+            identity["pro_token"],
+            identity["anon_id"],
+            identity["anon_id"],
+        ),
+    )
+    return [
+        {**row, "created_at": serialize_dt(row.get("created_at"))}
+        for row in (cur.fetchall() or [])
+    ]
+
+
 def count_words(text: str) -> int:
     return len(text.split())
 
@@ -4873,7 +4991,7 @@ def delete_teacher_class(class_id: int, request: Request):
 
 
 @app.get("/teacher/classes/{class_id}/students")
-def list_class_students(class_id: int, request: Request):
+def list_class_students(class_id: int, request: Request, student_detail: Optional[str] = None):
     teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
@@ -4909,7 +5027,7 @@ def list_class_students(class_id: int, request: Request):
             (class_id,),
         )
         rows = cur.fetchall() or []
-    return {
+        response = {
         "students": [
             {
                 **row,
@@ -4921,7 +5039,123 @@ def list_class_students(class_id: int, request: Request):
             }
             for row in rows
         ]
-    }
+        }
+
+        detail_key = (student_detail or "").strip()
+        if detail_key:
+            cur.execute(
+                """
+                SELECT id, anon_id, pro_token, display_name, joined_at
+                FROM class_memberships
+                WHERE class_id = %s
+                  AND (
+                    anon_id = %s
+                    OR pro_token = %s
+                  )
+                LIMIT 1
+                """,
+                (class_id, detail_key, detail_key),
+            )
+            membership = cur.fetchone()
+            if membership:
+                cur.execute(
+                    """
+                    SELECT
+                      work_id,
+                      section_id,
+                      COUNT(*) AS session_count,
+                      COALESCE(SUM(words_tapped), 0) AS total_words_tapped,
+                      MAX(created_at) AS last_visited
+                    FROM study_events
+                    WHERE (
+                      (%s IS NOT NULL AND pro_token = %s)
+                      OR
+                      (%s IS NOT NULL AND anon_id = %s)
+                    )
+                    GROUP BY work_id, section_id
+                    ORDER BY MAX(created_at) DESC
+                    """,
+                    (
+                        membership.get("pro_token"),
+                        membership.get("pro_token"),
+                        membership.get("anon_id"),
+                        membership.get("anon_id"),
+                    ),
+                )
+                event_rows = cur.fetchall() or []
+
+                cur.execute(
+                    """
+                    SELECT DATE(created_at) AS event_day, COUNT(*) AS event_count
+                    FROM study_events
+                    WHERE (
+                      (%s IS NOT NULL AND pro_token = %s)
+                      OR
+                      (%s IS NOT NULL AND anon_id = %s)
+                    )
+                      AND created_at >= NOW() - INTERVAL '6 days'
+                    GROUP BY DATE(created_at)
+                    ORDER BY event_day ASC
+                    """,
+                    (
+                        membership.get("pro_token"),
+                        membership.get("pro_token"),
+                        membership.get("anon_id"),
+                        membership.get("anon_id"),
+                    ),
+                )
+                event_days = {
+                    row["event_day"].isoformat(): int(row.get("event_count") or 0)
+                    for row in (cur.fetchall() or [])
+                    if row.get("event_day")
+                }
+
+                grouped_works: Dict[str, dict] = {}
+                for row in event_rows:
+                    work_id = row.get("work_id") or ""
+                    work_bucket = grouped_works.setdefault(work_id, {
+                        "work_id": work_id,
+                        "sections": [],
+                        "session_count": 0,
+                        "total_words_tapped": 0,
+                        "last_visited": None,
+                    })
+                    section_payload = {
+                        "section_id": row.get("section_id"),
+                        "session_count": int(row.get("session_count") or 0),
+                        "total_words_tapped": int(row.get("total_words_tapped") or 0),
+                        "last_visited": serialize_dt(row.get("last_visited")),
+                    }
+                    work_bucket["sections"].append(section_payload)
+                    work_bucket["session_count"] += section_payload["session_count"]
+                    work_bucket["total_words_tapped"] += section_payload["total_words_tapped"]
+                    current_last = work_bucket.get("last_visited")
+                    next_last = section_payload["last_visited"]
+                    if next_last and (not current_last or next_last > current_last):
+                        work_bucket["last_visited"] = next_last
+
+                activity_days = []
+                today = datetime.utcnow().date()
+                for offset in range(6, -1, -1):
+                    day = (today - timedelta(days=offset)).isoformat()
+                    activity_days.append({
+                        "date": day,
+                        "active": bool(event_days.get(day)),
+                        "event_count": int(event_days.get(day) or 0),
+                    })
+
+                response["student_detail"] = {
+                    "identity": {
+                        "anon_id": membership.get("anon_id"),
+                        "pro_token": membership.get("pro_token"),
+                        "display_name": membership.get("display_name"),
+                        "joined_at": serialize_dt(membership.get("joined_at")),
+                    },
+                    "works": list(grouped_works.values()),
+                    "activity_days": activity_days,
+                }
+
+        return response
 
 
 @app.post("/teacher/assignments")
@@ -5076,6 +5310,7 @@ def list_teacher_submissions(assignment_id: int, request: Request):
               s.student_anon_id,
               s.student_pro_token,
               s.submitted_at,
+              s.marked_at,
               s.status,
               COALESCE(cm.display_name, s.student_anon_id, s.student_pro_token) AS student_name
             FROM assignment_submissions s
@@ -5147,6 +5382,7 @@ def list_teacher_submissions(assignment_id: int, request: Request):
             {
                 **row,
                 "submitted_at": serialize_dt(row.get("submitted_at")),
+                "marked_at": serialize_dt(row.get("marked_at")),
                 "student_identity": row.get("student_name") or row.get("student_anon_id") or row.get("student_pro_token"),
                 "answers": answers_by_submission.get(row["id"], []),
                 "submission_annotations": annotations_by_submission.get(row["id"], []),
@@ -5154,6 +5390,22 @@ def list_teacher_submissions(assignment_id: int, request: Request):
             for row in submissions
         ],
     }
+
+
+@app.get("/teacher/assignments/{assignment_id}/stats")
+def teacher_assignment_stats(assignment_id: int, request: Request):
+    teacher_token = require_valid_pro_token(request)
+    with get_db() as cur:
+        cur.execute(
+            "SELECT id, teacher_token FROM assignments WHERE id = %s",
+            (assignment_id,),
+        )
+        assignment = cur.fetchone()
+        if not assignment:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+        if assignment["teacher_token"] != teacher_token:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return assignment_stats(cur, assignment_id)
 
 
 @app.post("/teacher/mark")
@@ -5193,7 +5445,8 @@ def mark_teacher_submission(req: TeacherMarkSubmissionRequest, request: Request)
         cur.execute(
             """
             UPDATE assignment_submissions
-            SET status = 'marked'
+            SET status = 'marked',
+                marked_at = NOW()
             WHERE id = %s
             """,
             (req.submission_id,),
@@ -5270,6 +5523,66 @@ def delete_teacher_shared_resource(resource_id: int, request: Request):
             raise HTTPException(status_code=403, detail="Forbidden")
         cur.execute("DELETE FROM shared_resources WHERE id = %s", (resource_id,))
     return {"ok": True}
+
+
+@app.post("/teacher/announcements")
+def create_teacher_announcement(req: TeacherAnnouncementCreateRequest, request: Request):
+    teacher_token = require_valid_pro_token(request)
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message required")
+    with get_db() as cur:
+        require_class_owner(cur, req.class_id, teacher_token)
+        cur.execute(
+            """
+            INSERT INTO class_announcements (class_id, teacher_token, message)
+            VALUES (%s, %s, %s)
+            RETURNING id, class_id, teacher_token, message, created_at
+            """,
+            (req.class_id, teacher_token, message),
+        )
+        row = cur.fetchone()
+    return {**row, "created_at": serialize_dt(row.get("created_at"))}
+
+
+@app.delete("/teacher/announcements/{announcement_id}")
+def delete_teacher_announcement(announcement_id: int, request: Request):
+    teacher_token = require_valid_pro_token(request)
+    with get_db() as cur:
+        cur.execute(
+            """
+            SELECT ca.id, ca.class_id, c.teacher_token
+            FROM class_announcements ca
+            JOIN classes c ON c.id = ca.class_id
+            WHERE ca.id = %s
+            """,
+            (announcement_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Announcement not found")
+        if row["teacher_token"] != teacher_token:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        cur.execute("DELETE FROM class_announcements WHERE id = %s", (announcement_id,))
+    return {"ok": True}
+
+
+@app.get("/teacher/announcements/{class_id}")
+def list_teacher_announcements(class_id: int, request: Request):
+    teacher_token = require_valid_pro_token(request)
+    with get_db() as cur:
+        require_class_owner(cur, class_id, teacher_token)
+        cur.execute(
+            """
+            SELECT id, class_id, teacher_token, message, created_at
+            FROM class_announcements
+            WHERE class_id = %s
+            ORDER BY created_at DESC, id DESC
+            """,
+            (class_id,),
+        )
+        rows = cur.fetchall() or []
+    return {"announcements": [{**row, "created_at": serialize_dt(row.get("created_at"))} for row in rows]}
 
 
 # -------------------------
@@ -5369,25 +5682,35 @@ def list_student_assignments(request: Request):
               a.instructions,
               a.due_date,
               a.created_at,
-              EXISTS (
-                SELECT 1
-                FROM assignment_submissions s
-                WHERE s.assignment_id = a.id
-                  AND (
-                    (%s IS NOT NULL AND s.student_pro_token = %s)
-                    OR
-                    (%s IS NOT NULL AND s.student_anon_id = %s)
-                  )
-              ) AS submitted
+              submission_bundle.submission_id,
+              submission_bundle.submitted_at,
+              submission_bundle.marked_at,
+              submission_bundle.status AS submission_status
             FROM assignments a
             JOIN classes c ON c.id = a.class_id
             JOIN class_memberships cm ON cm.class_id = c.id
+            LEFT JOIN LATERAL (
+              SELECT
+                s.id AS submission_id,
+                s.submitted_at,
+                s.marked_at,
+                s.status
+              FROM assignment_submissions s
+              WHERE s.assignment_id = a.id
+                AND (
+                  (%s IS NOT NULL AND s.student_pro_token = %s)
+                  OR
+                  (%s IS NOT NULL AND s.student_anon_id = %s)
+                )
+              ORDER BY s.submitted_at DESC, s.id DESC
+              LIMIT 1
+            ) AS submission_bundle ON TRUE
             WHERE (
                 (%s IS NOT NULL AND cm.pro_token = %s)
                 OR
                 (%s IS NOT NULL AND cm.anon_id = %s)
             )
-            ORDER BY a.created_at DESC, a.id DESC
+            ORDER BY a.due_date ASC NULLS LAST, a.created_at DESC, a.id DESC
             """,
             (
                 identity["pro_token"],
@@ -5408,7 +5731,13 @@ def list_student_assignments(request: Request):
                 **row,
                 "due_date": serialize_dt(row.get("due_date")),
                 "created_at": serialize_dt(row.get("created_at")),
-                "submitted": bool(row.get("submitted")),
+                "submitted": bool(row.get("submission_id")),
+                "submission": {
+                    "id": row.get("submission_id"),
+                    "status": row.get("submission_status"),
+                    "submitted_at": serialize_dt(row.get("submitted_at")),
+                    "marked_at": serialize_dt(row.get("marked_at")),
+                } if row.get("submission_id") else None,
                 "questions": questions_by_assignment.get(row["id"], []),
             }
             for row in rows
@@ -5473,7 +5802,7 @@ def submit_student_assignment(req: StudentSubmitAssignmentRequest, request: Requ
             """
             INSERT INTO assignment_submissions (assignment_id, student_anon_id, student_pro_token)
             VALUES (%s, %s, %s)
-            RETURNING id, assignment_id, student_anon_id, student_pro_token, submitted_at, status
+            RETURNING id, assignment_id, student_anon_id, student_pro_token, submitted_at, marked_at, status
             """,
             (req.assignment_id, identity["anon_id"], identity["pro_token"]),
         )
@@ -5509,7 +5838,14 @@ def submit_student_assignment(req: StudentSubmitAssignmentRequest, request: Requ
                         text,
                     ),
                 )
-    return {"ok": True, "submission": {**submission, "submitted_at": serialize_dt(submission.get("submitted_at"))}}
+    return {
+        "ok": True,
+        "submission": {
+            **submission,
+            "submitted_at": serialize_dt(submission.get("submitted_at")),
+            "marked_at": serialize_dt(submission.get("marked_at")),
+        },
+    }
 
 
 @app.get("/student/submissions")
@@ -5524,12 +5860,15 @@ def list_student_submissions(request: Request):
               s.student_anon_id,
               s.student_pro_token,
               s.submitted_at,
+              s.marked_at,
               s.status,
               a.title,
               a.type,
               a.work_id,
               a.section_id,
-              c.name AS class_name
+              c.name AS class_name,
+              a.instructions,
+              a.due_date
             FROM assignment_submissions s
             JOIN assignments a ON a.id = s.assignment_id
             JOIN classes c ON c.id = a.class_id
@@ -5550,6 +5889,7 @@ def list_student_submissions(request: Request):
         submissions = cur.fetchall() or []
         submission_ids = [row["id"] for row in submissions]
         answers_by_submission: Dict[int, List[dict]] = {}
+        annotations_by_submission: Dict[int, List[dict]] = {}
         if submission_ids:
             cur.execute(
                 """
@@ -5573,16 +5913,46 @@ def list_student_submissions(request: Request):
             )
             for row in cur.fetchall() or []:
                 answers_by_submission.setdefault(row["submission_id"], []).append(row)
+            cur.execute(
+                """
+                SELECT
+                  id,
+                  submission_id,
+                  token_index,
+                  token_text,
+                  annotation_text,
+                  created_at
+                FROM submission_annotations
+                WHERE submission_id = ANY(%s)
+                ORDER BY submission_id, token_index, id
+                """,
+                (submission_ids,),
+            )
+            for row in cur.fetchall() or []:
+                annotations_by_submission.setdefault(row["submission_id"], []).append({
+                    **row,
+                    "created_at": serialize_dt(row.get("created_at")),
+                })
     return {
         "submissions": [
             {
                 **row,
                 "submitted_at": serialize_dt(row.get("submitted_at")),
+                "marked_at": serialize_dt(row.get("marked_at")),
+                "due_date": serialize_dt(row.get("due_date")),
                 "answers": answers_by_submission.get(row["id"], []),
+                "submission_annotations": annotations_by_submission.get(row["id"], []),
             }
             for row in submissions
         ]
     }
+
+
+@app.get("/student/announcements")
+def list_student_announcements(request: Request):
+    identity = get_student_identity(request)
+    with get_db() as cur:
+        return {"announcements": list_announcements_for_student(cur, identity)}
 
 
 @app.get("/student/shared-resources")
