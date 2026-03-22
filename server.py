@@ -102,6 +102,11 @@ def init_db():
         """)
 
         cur.execute("""
+        ALTER TABLE pro_tokens
+        ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'student'
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS annotations (
           id SERIAL PRIMARY KEY,
           customer_id TEXT NOT NULL,
@@ -524,6 +529,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-0")
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
+TEACHER_PRICE_ID = os.environ["TEACHER_PRICE_ID"]  # Stripe Dashboard -> Product catalog -> Teacher Pro price -> API ID (price_...)
 FRONTEND_URL = os.environ["FRONTEND_URL"]
 FREE_AI_CREDITS = int(os.environ.get("FREE_AI_CREDITS", "5"))
 POSTHOG_PROJECT_API_KEY = (
@@ -634,6 +640,43 @@ def stripe_price_is_recurring() -> bool:
     except Exception as e:
         print(f"Failed to read Stripe price metadata: {e}")
         return True
+
+
+def get_checkout_price_id(session_id: str) -> str | None:
+    try:
+        line_items = stripe.checkout.Session.list_line_items(session_id, limit=1)
+    except Exception as e:
+        print(f"Failed to fetch checkout line items for session {session_id}: {e}")
+        return None
+
+    if not getattr(line_items, "data", None):
+        return None
+
+    item = line_items.data[0]
+    price = getattr(item, "price", None)
+    if isinstance(price, str):
+        return price
+    if price is not None:
+        return getattr(price, "id", None)
+    return None
+
+
+def get_tier_for_price_id(price_id: str | None) -> str:
+    return "teacher" if price_id == TEACHER_PRICE_ID else "student"
+
+
+def get_token_tier(pro_token: str) -> str:
+    with get_db() as cur:
+        cur.execute(
+            "SELECT tier FROM pro_tokens WHERE token = %s",
+            (pro_token,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=403, detail="Valid Pro token required")
+
+    return row.get("tier") or "student"
 
 
 def stripe_customer_has_paid_access(customer_id: str | None) -> bool:
@@ -1915,19 +1958,21 @@ def email_corpus(payload: EmailCorpusRequest, request: Request):
 # -------------------------
 
 @app.get("/create-checkout-session")
-def create_checkout_session(request: Request, promo: Optional[str] = None):
+def create_checkout_session(request: Request, promo: Optional[str] = None, plan: Optional[str] = None):
     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
     promo_code = (promo or "").strip()
+    selected_plan = (plan or "").strip().lower()
+    price_id = TEACHER_PRICE_ID if selected_plan == "teacher" else STRIPE_PRICE_ID
     try:
         # Stripe price type drives checkout mode:
         # recurring -> subscription, one-time -> payment
-        price = stripe.Price.retrieve(STRIPE_PRICE_ID)
+        price = stripe.Price.retrieve(price_id)
         recurring = price.get("recurring")
         checkout_mode = "subscription" if recurring else "payment"
 
         checkout_payload = {
             "mode": checkout_mode,
-            "line_items": [{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            "line_items": [{"price": price_id, "quantity": 1}],
             "allow_promotion_codes": True,
             "billing_address_collection": "required",
             "success_url": f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
@@ -1959,6 +2004,7 @@ def create_checkout_session(request: Request, promo: Optional[str] = None):
                 "has_promo_code": bool(promo_code),
                 "origin": origin,
                 "mode": checkout_mode,
+                "plan": selected_plan or "student",
             },
         )
         return {"url": session.url}
@@ -2000,6 +2046,7 @@ async def stripe_webhook(request: Request):
         customer_id = session["customer"]
         email = session["customer_details"]["email"]
         origin = get_frontend_origin(request)
+        tier = get_tier_for_price_id(get_checkout_price_id(session["id"]))
 
         restore_token = secrets.token_urlsafe(32)
         expires_at = datetime.utcnow() + timedelta(days=7)
@@ -2016,7 +2063,10 @@ async def stripe_webhook(request: Request):
             "stripe_checkout_completed",
             request,
             customer_id=customer_id,
-            properties={"email_domain": email.split("@")[-1] if "@" in email else ""},
+            properties={
+                "email_domain": email.split("@")[-1] if "@" in email else "",
+                "tier": tier,
+            },
         )
 
     return {"ok": True}
@@ -2046,14 +2096,16 @@ def checkout_success(session_id: str, request: Request):
         if not customer_id:
             raise HTTPException(status_code=400, detail="Missing customer")
 
+        price_id = get_checkout_price_id(session_id)
+        tier = get_tier_for_price_id(price_id)
         pro_token = secrets.token_urlsafe(32)
         restore_token = secrets.token_urlsafe(32)
         expires_at = datetime.utcnow() + timedelta(days=7)
 
         with get_db() as cur:
             cur.execute(
-                "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
-                (pro_token, customer_id)
+                "INSERT INTO pro_tokens (token, customer_id, tier) VALUES (%s, %s, %s)",
+                (pro_token, customer_id, tier)
             )
             cur.execute("""
                 INSERT INTO restore_tokens (token, customer_id, expires_at)
@@ -2075,7 +2127,7 @@ def checkout_success(session_id: str, request: Request):
             "checkout_success_token_issued",
             request,
             customer_id=customer_id,
-            properties={"has_email": bool(email)},
+            properties={"has_email": bool(email), "tier": tier},
         )
 
         return {"pro_token": pro_token}
@@ -2217,6 +2269,14 @@ def billing_portal(request: Request):
     )
 
     return {"url": portal.url}
+
+
+@app.get("/billing/tier")
+def billing_tier(request: Request):
+    token = request.headers.get("X-Pro-Token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Valid Pro token required")
+    return {"tier": get_token_tier(token)}
 
 
 @app.get("/billing/restore-token")
@@ -4368,6 +4428,14 @@ def require_valid_pro_token(request: Request) -> str:
     return token
 
 
+def require_teacher_pro_token(request: Request) -> str:
+    token = require_valid_pro_token(request)
+    tier = get_token_tier(token)
+    if tier != "teacher":
+        raise HTTPException(status_code=403, detail="Teacher subscription required")
+    return token
+
+
 def get_student_identity(request: Request) -> Dict[str, Optional[str]]:
     pro_token = request.headers.get("X-Pro-Token")
     if pro_token and customer_from_token(pro_token):
@@ -4883,13 +4951,12 @@ def delete_all_flashcards(request: Request):
 # TEACHER DASHBOARD
 # -------------------------
 
-# TODO: gate teacher features on a separate teacher Pro tier
 # TODO: email notifications to students when assignment is set
 # TODO: AI-assisted marking suggestions using /ai/exam-mark
 
 @app.post("/teacher/setup")
 def teacher_setup(req: TeacherSetupRequest, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     display_name = (req.display_name or "").strip() or None
     with get_db() as cur:
         cur.execute(
@@ -4911,7 +4978,7 @@ def teacher_setup(req: TeacherSetupRequest, request: Request):
 
 @app.get("/teacher/profile")
 def teacher_profile(request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -4929,7 +4996,7 @@ def teacher_profile(request: Request):
 
 @app.post("/teacher/classes")
 def create_teacher_class(req: TeacherClassCreateRequest, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     name = (req.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Class name required")
@@ -4949,7 +5016,7 @@ def create_teacher_class(req: TeacherClassCreateRequest, request: Request):
 
 @app.get("/teacher/classes")
 def list_teacher_classes(request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -4983,7 +5050,7 @@ def list_teacher_classes(request: Request):
 
 @app.delete("/teacher/classes/{class_id}")
 def delete_teacher_class(class_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute("DELETE FROM classes WHERE id = %s", (class_id,))
@@ -4992,7 +5059,7 @@ def delete_teacher_class(class_id: int, request: Request):
 
 @app.get("/teacher/classes/{class_id}/students")
 def list_class_students(class_id: int, request: Request, student_detail: Optional[str] = None):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
@@ -5160,7 +5227,7 @@ def list_class_students(class_id: int, request: Request, student_detail: Optiona
 
 @app.post("/teacher/assignments")
 def create_teacher_assignment(req: TeacherAssignmentCreateRequest, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     assignment_type = (req.type or "").strip()
     title = (req.title or "").strip()
     if assignment_type not in {"annotation", "question_set"}:
@@ -5226,7 +5293,7 @@ def create_teacher_assignment(req: TeacherAssignmentCreateRequest, request: Requ
 
 @app.get("/teacher/assignments/{class_id}")
 def list_teacher_assignments(class_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
@@ -5269,7 +5336,7 @@ def list_teacher_assignments(class_id: int, request: Request):
 
 @app.delete("/teacher/assignments/{assignment_id}")
 def delete_teacher_assignment(assignment_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             "SELECT id, teacher_token FROM assignments WHERE id = %s",
@@ -5286,7 +5353,7 @@ def delete_teacher_assignment(assignment_id: int, request: Request):
 
 @app.get("/teacher/submissions/{assignment_id}")
 def list_teacher_submissions(assignment_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -5394,7 +5461,7 @@ def list_teacher_submissions(assignment_id: int, request: Request):
 
 @app.get("/teacher/assignments/{assignment_id}/stats")
 def teacher_assignment_stats(assignment_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             "SELECT id, teacher_token FROM assignments WHERE id = %s",
@@ -5410,7 +5477,7 @@ def teacher_assignment_stats(assignment_id: int, request: Request):
 
 @app.post("/teacher/mark")
 def mark_teacher_submission(req: TeacherMarkSubmissionRequest, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -5456,7 +5523,7 @@ def mark_teacher_submission(req: TeacherMarkSubmissionRequest, request: Request)
 
 @app.post("/teacher/shared-resources")
 def create_shared_resource(req: SharedResourceCreateRequest, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     resource_type = (req.type or "").strip()
     if resource_type not in {"annotation", "example_question"}:
         raise HTTPException(status_code=400, detail="Invalid resource type")
@@ -5492,7 +5559,7 @@ def create_shared_resource(req: SharedResourceCreateRequest, request: Request):
 
 @app.get("/teacher/shared-resources/{class_id}")
 def list_teacher_shared_resources(class_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
@@ -5510,7 +5577,7 @@ def list_teacher_shared_resources(class_id: int, request: Request):
 
 @app.delete("/teacher/shared-resources/{resource_id}")
 def delete_teacher_shared_resource(resource_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             "SELECT id, teacher_token FROM shared_resources WHERE id = %s",
@@ -5527,7 +5594,7 @@ def delete_teacher_shared_resource(resource_id: int, request: Request):
 
 @app.post("/teacher/announcements")
 def create_teacher_announcement(req: TeacherAnnouncementCreateRequest, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message required")
@@ -5547,7 +5614,7 @@ def create_teacher_announcement(req: TeacherAnnouncementCreateRequest, request: 
 
 @app.delete("/teacher/announcements/{announcement_id}")
 def delete_teacher_announcement(announcement_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -5569,7 +5636,7 @@ def delete_teacher_announcement(announcement_id: int, request: Request):
 
 @app.get("/teacher/announcements/{class_id}")
 def list_teacher_announcements(class_id: int, request: Request):
-    teacher_token = require_valid_pro_token(request)
+    teacher_token = require_teacher_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
