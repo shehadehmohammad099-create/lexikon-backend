@@ -18,6 +18,11 @@ from contextlib import contextmanager
 import json
 import stanza
 import re
+import base64
+import html
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -54,6 +59,13 @@ ensure_google_credentials_file()
 
 # Initialize Stanza pipelines (downloaded on first use)
 STANZA_PIPELINES = {}
+
+PERSEUS_CTS_URL = "https://www.perseus.tufts.edu/hopper/CTS"
+PERSEUS_DOWNLOAD_URL = "https://www.perseus.tufts.edu/hopper/dltext"
+PERSEUS_CACHE_TTL_SECONDS = 6 * 60 * 60
+PERSEUS_CATALOG_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "works": [], "versions": {}}
+PERSEUS_TEXT_CACHE: Dict[str, Dict[str, Any]] = {}
+PERSEUS_TEXT_CACHE_MAX = 12
 
 def get_stanza_pipeline(lang: str):
     """Get or create a Stanza pipeline for the given language."""
@@ -99,11 +111,6 @@ def init_db():
           customer_id TEXT NOT NULL,
           created_at TIMESTAMPTZ DEFAULT NOW()
         )
-        """)
-
-        cur.execute("""
-        ALTER TABLE pro_tokens
-        ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'student'
         """)
 
         cur.execute("""
@@ -325,14 +332,8 @@ def init_db():
           student_anon_id TEXT,
           student_pro_token TEXT,
           submitted_at TIMESTAMP DEFAULT NOW(),
-          marked_at TIMESTAMP,
           status TEXT DEFAULT 'submitted' CHECK (status IN ('submitted', 'marked'))
         )
-        """)
-
-        cur.execute("""
-        ALTER TABLE assignment_submissions
-        ADD COLUMN IF NOT EXISTS marked_at TIMESTAMP
         """)
 
         cur.execute("""
@@ -392,21 +393,6 @@ def init_db():
         cur.execute("""
         CREATE INDEX IF NOT EXISTS shared_resources_class_idx
         ON shared_resources (class_id, created_at DESC)
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS class_announcements (
-          id SERIAL PRIMARY KEY,
-          class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE,
-          teacher_token TEXT NOT NULL,
-          message TEXT NOT NULL,
-          created_at TIMESTAMP DEFAULT NOW()
-        )
-        """)
-
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS class_announcements_class_idx
-        ON class_announcements (class_id, created_at DESC)
         """)
 
         cur.execute("""
@@ -529,7 +515,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-0")
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
-TEACHER_PRICE_ID = os.environ["TEACHER_PRICE_ID"]  # Stripe Dashboard -> Product catalog -> Teacher Pro price -> API ID (price_...)
 FRONTEND_URL = os.environ["FRONTEND_URL"]
 FREE_AI_CREDITS = int(os.environ.get("FREE_AI_CREDITS", "5"))
 POSTHOG_PROJECT_API_KEY = (
@@ -640,43 +625,6 @@ def stripe_price_is_recurring() -> bool:
     except Exception as e:
         print(f"Failed to read Stripe price metadata: {e}")
         return True
-
-
-def get_checkout_price_id(session_id: str) -> str | None:
-    try:
-        line_items = stripe.checkout.Session.list_line_items(session_id, limit=1)
-    except Exception as e:
-        print(f"Failed to fetch checkout line items for session {session_id}: {e}")
-        return None
-
-    if not getattr(line_items, "data", None):
-        return None
-
-    item = line_items.data[0]
-    price = getattr(item, "price", None)
-    if isinstance(price, str):
-        return price
-    if price is not None:
-        return getattr(price, "id", None)
-    return None
-
-
-def get_tier_for_price_id(price_id: str | None) -> str:
-    return "teacher" if price_id == TEACHER_PRICE_ID else "student"
-
-
-def get_token_tier(pro_token: str) -> str:
-    with get_db() as cur:
-        cur.execute(
-            "SELECT tier FROM pro_tokens WHERE token = %s",
-            (pro_token,),
-        )
-        row = cur.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=403, detail="Valid Pro token required")
-
-    return row.get("tier") or "student"
 
 
 def stripe_customer_has_paid_access(customer_id: str | None) -> bool:
@@ -1349,11 +1297,6 @@ class SharedResourceCreateRequest(BaseModel):
     model_answer: Optional[str] = ""
 
 
-class TeacherAnnouncementCreateRequest(BaseModel):
-    class_id: int
-    message: str
-
-
 class StudentJoinClassRequest(BaseModel):
     join_code: str
     display_name: Optional[str] = ""
@@ -1958,21 +1901,19 @@ def email_corpus(payload: EmailCorpusRequest, request: Request):
 # -------------------------
 
 @app.get("/create-checkout-session")
-def create_checkout_session(request: Request, promo: Optional[str] = None, plan: Optional[str] = None):
+def create_checkout_session(request: Request, promo: Optional[str] = None):
     origin = request.headers.get("origin") or "https://the-lexicon-project.netlify.app"
     promo_code = (promo or "").strip()
-    selected_plan = (plan or "").strip().lower()
-    price_id = TEACHER_PRICE_ID if selected_plan == "teacher" else STRIPE_PRICE_ID
     try:
         # Stripe price type drives checkout mode:
         # recurring -> subscription, one-time -> payment
-        price = stripe.Price.retrieve(price_id)
+        price = stripe.Price.retrieve(STRIPE_PRICE_ID)
         recurring = price.get("recurring")
         checkout_mode = "subscription" if recurring else "payment"
 
         checkout_payload = {
             "mode": checkout_mode,
-            "line_items": [{"price": price_id, "quantity": 1}],
+            "line_items": [{"price": STRIPE_PRICE_ID, "quantity": 1}],
             "allow_promotion_codes": True,
             "billing_address_collection": "required",
             "success_url": f"{origin}/app.html?session_id={{CHECKOUT_SESSION_ID}}",
@@ -2004,7 +1945,6 @@ def create_checkout_session(request: Request, promo: Optional[str] = None, plan:
                 "has_promo_code": bool(promo_code),
                 "origin": origin,
                 "mode": checkout_mode,
-                "plan": selected_plan or "student",
             },
         )
         return {"url": session.url}
@@ -2046,7 +1986,6 @@ async def stripe_webhook(request: Request):
         customer_id = session["customer"]
         email = session["customer_details"]["email"]
         origin = get_frontend_origin(request)
-        tier = get_tier_for_price_id(get_checkout_price_id(session["id"]))
 
         restore_token = secrets.token_urlsafe(32)
         expires_at = datetime.utcnow() + timedelta(days=7)
@@ -2063,10 +2002,7 @@ async def stripe_webhook(request: Request):
             "stripe_checkout_completed",
             request,
             customer_id=customer_id,
-            properties={
-                "email_domain": email.split("@")[-1] if "@" in email else "",
-                "tier": tier,
-            },
+            properties={"email_domain": email.split("@")[-1] if "@" in email else ""},
         )
 
     return {"ok": True}
@@ -2096,16 +2032,14 @@ def checkout_success(session_id: str, request: Request):
         if not customer_id:
             raise HTTPException(status_code=400, detail="Missing customer")
 
-        price_id = get_checkout_price_id(session_id)
-        tier = get_tier_for_price_id(price_id)
         pro_token = secrets.token_urlsafe(32)
         restore_token = secrets.token_urlsafe(32)
         expires_at = datetime.utcnow() + timedelta(days=7)
 
         with get_db() as cur:
             cur.execute(
-                "INSERT INTO pro_tokens (token, customer_id, tier) VALUES (%s, %s, %s)",
-                (pro_token, customer_id, tier)
+                "INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)",
+                (pro_token, customer_id)
             )
             cur.execute("""
                 INSERT INTO restore_tokens (token, customer_id, expires_at)
@@ -2127,7 +2061,7 @@ def checkout_success(session_id: str, request: Request):
             "checkout_success_token_issued",
             request,
             customer_id=customer_id,
-            properties={"has_email": bool(email), "tier": tier},
+            properties={"has_email": bool(email)},
         )
 
         return {"pro_token": pro_token}
@@ -2269,14 +2203,6 @@ def billing_portal(request: Request):
     )
 
     return {"url": portal.url}
-
-
-@app.get("/billing/tier")
-def billing_tier(request: Request):
-    token = request.headers.get("X-Pro-Token")
-    if not token:
-        raise HTTPException(status_code=401, detail="Valid Pro token required")
-    return {"tier": get_token_tier(token)}
 
 
 @app.get("/billing/restore-token")
@@ -4386,6 +4312,424 @@ def restore_pro(session_id: str):
 
 
 # -------------------------
+# PERSEUS DIGITAL LIBRARY
+# -------------------------
+
+def _xml_local_name(tag: str) -> str:
+    return str(tag or "").split("}")[-1]
+
+
+def _xml_lang(node: ET.Element, fallback: str = "") -> str:
+    return (
+        node.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")
+        or node.attrib.get("lang")
+        or fallback
+    )
+
+
+def _child_text(node: ET.Element, local_name: str, fallback: str = "") -> str:
+    for child in list(node):
+        if _xml_local_name(child.tag) == local_name:
+            value = " ".join("".join(child.itertext()).split())
+            if value:
+                return value
+    return fallback
+
+
+def _perseus_reader_id(urn: str) -> str:
+    encoded = base64.urlsafe_b64encode(urn.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"perseus_{encoded}"
+
+
+def _perseus_citation_labels(version_node: ET.Element) -> List[str]:
+    labels: List[str] = []
+    for node in version_node.iter():
+        if _xml_local_name(node.tag) == "citation":
+            label = str(node.attrib.get("label") or "").strip()
+            if label and label not in labels:
+                labels.append(label)
+    return labels
+
+
+def _parse_perseus_catalog(xml_bytes: bytes) -> tuple[List[dict], Dict[str, dict]]:
+    root = ET.fromstring(xml_bytes)
+    works: List[dict] = []
+    versions_by_urn: Dict[str, dict] = {}
+
+    for group in root.iter():
+        if _xml_local_name(group.tag) != "textgroup":
+            continue
+        author = _child_text(group, "groupname", "Unknown author")
+
+        for work_node in list(group):
+            if _xml_local_name(work_node.tag) != "work":
+                continue
+            work_urn = str(work_node.attrib.get("urn") or "").strip()
+            work_language = _xml_lang(work_node)
+            title = _child_text(work_node, "title", "Untitled work")
+            versions: List[dict] = []
+
+            for version_node in list(work_node):
+                kind = _xml_local_name(version_node.tag)
+                if kind not in {"edition", "translation"}:
+                    continue
+                urn = str(version_node.attrib.get("urn") or "").strip()
+                if not urn:
+                    continue
+                language = _xml_lang(version_node, work_language if kind == "edition" else "eng")
+                label = _child_text(version_node, "label", title)
+                description = _child_text(version_node, "description", "")
+                online = next(
+                    (child for child in list(version_node) if _xml_local_name(child.tag) == "online"),
+                    None,
+                )
+                docname = str(online.attrib.get("docname") or "").strip() if online is not None else ""
+                document_id = re.sub(r"\.xml$", "", docname, flags=re.IGNORECASE)
+                descriptor = {
+                    "id": _perseus_reader_id(urn),
+                    "urn": urn,
+                    "work_urn": work_urn,
+                    "title": title,
+                    "author": author,
+                    "language": language,
+                    "kind": kind,
+                    "version_label": label,
+                    "description": description,
+                    "document_id": document_id,
+                    "available": bool(document_id),
+                    "citation_labels": _perseus_citation_labels(version_node),
+                    "isPerseus": True,
+                }
+                versions.append(descriptor)
+                versions_by_urn[urn] = descriptor
+
+            if versions:
+                preferred = next((v for v in versions if v["kind"] == "edition" and v["available"]), None)
+                preferred = preferred or next((v for v in versions if v["available"]), versions[0])
+                works.append({
+                    "urn": work_urn,
+                    "title": title,
+                    "author": author,
+                    "language": work_language,
+                    "versions": versions,
+                    "default_version_id": preferred["id"],
+                })
+
+    works.sort(key=lambda row: (row["author"].casefold(), row["title"].casefold()))
+    return works, versions_by_urn
+
+
+def get_perseus_catalog(force: bool = False) -> tuple[List[dict], Dict[str, dict]]:
+    now = time.time()
+    if (
+        not force
+        and PERSEUS_CATALOG_CACHE["works"]
+        and now - float(PERSEUS_CATALOG_CACHE["loaded_at"]) < PERSEUS_CACHE_TTL_SECONDS
+    ):
+        return PERSEUS_CATALOG_CACHE["works"], PERSEUS_CATALOG_CACHE["versions"]
+
+    try:
+        response = requests.get(
+            PERSEUS_CTS_URL,
+            params={"request": "GetCapabilities"},
+            timeout=35,
+        )
+        response.raise_for_status()
+        works, versions = _parse_perseus_catalog(response.content)
+        if not works:
+            raise ValueError("Perseus returned an empty catalogue")
+    except Exception as exc:
+        if PERSEUS_CATALOG_CACHE["works"]:
+            print(f"Perseus catalogue refresh failed; serving cache: {exc}")
+            return PERSEUS_CATALOG_CACHE["works"], PERSEUS_CATALOG_CACHE["versions"]
+        raise HTTPException(status_code=502, detail="Perseus catalogue is temporarily unavailable") from exc
+
+    PERSEUS_CATALOG_CACHE.update({"loaded_at": now, "works": works, "versions": versions})
+    return works, versions
+
+
+_BETA_BASE = {
+    "a": "α", "b": "β", "g": "γ", "d": "δ", "e": "ε", "z": "ζ",
+    "h": "η", "q": "θ", "i": "ι", "k": "κ", "l": "λ", "m": "μ",
+    "n": "ν", "c": "ξ", "o": "ο", "p": "π", "r": "ρ", "s": "σ",
+    "t": "τ", "u": "υ", "f": "φ", "x": "χ", "y": "ψ", "w": "ω",
+    "v": "ϝ",
+}
+_BETA_MARKS = {
+    ")": "\u0313", "(": "\u0314", "/": "\u0301", "\\": "\u0300",
+    "=": "\u0342", "|": "\u0345", "+": "\u0308",
+}
+
+
+def _beta_has_letter_ahead(value: str, start: int) -> bool:
+    i = start
+    while i < len(value) and value[i] in ")(/\\=|+1234567890":
+        i += 1
+    return i < len(value) and value[i].lower() in _BETA_BASE
+
+
+def beta_code_to_unicode(value: str) -> str:
+    """Convert the legacy Perseus Greek beta code used by full XML downloads."""
+    if not value or re.search(r"[\u0370-\u03ff\u1f00-\u1fff]", value):
+        return value
+    out: List[str] = []
+    i = 0
+    while i < len(value):
+        uppercase = False
+        prefix_marks: List[str] = []
+        if value[i] == "*":
+            uppercase = True
+            i += 1
+            while i < len(value) and value[i] in _BETA_MARKS:
+                prefix_marks.append(value[i])
+                i += 1
+        if i >= len(value):
+            break
+        raw = value[i]
+        base_key = raw.lower()
+        if base_key not in _BETA_BASE:
+            if raw == "_":
+                out.append("—")
+            elif raw == ":":
+                out.append("·")
+            elif raw == "'":
+                out.append("᾽")
+            elif raw in "[]{}":
+                out.append(raw)
+            elif raw == "%":
+                while i + 1 < len(value) and value[i + 1].isdigit():
+                    i += 1
+            else:
+                out.append(raw)
+            i += 1
+            continue
+
+        i += 1
+        suffix_marks: List[str] = []
+        while i < len(value) and value[i] in _BETA_MARKS:
+            suffix_marks.append(value[i])
+            i += 1
+        while i < len(value) and value[i].isdigit():
+            i += 1
+
+        letter = _BETA_BASE[base_key]
+        if base_key == "s" and not uppercase and not _beta_has_letter_ahead(value, i):
+            letter = "ς"
+        if uppercase:
+            letter = letter.upper()
+        mark_order = {")": 0, "(": 0, "+": 1, "/": 2, "\\": 2, "=": 2, "|": 3}
+        ordered_marks = sorted(prefix_marks + suffix_marks, key=lambda mark: mark_order.get(mark, 9))
+        combining = "".join(_BETA_MARKS[m] for m in ordered_marks)
+        out.append(unicodedata.normalize("NFC", letter + combining))
+    return "".join(out)
+
+
+def _clean_perseus_xml(raw: bytes) -> ET.Element:
+    text = raw.decode("utf-8", errors="replace")
+    text = re.sub(r"<!DOCTYPE[^>]*(?:\[[\s\S]*?\]\s*)?>", "", text, count=1, flags=re.IGNORECASE)
+    text = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)[A-Za-z][A-Za-z0-9._-]*;", " ", text)
+    return ET.fromstring(text)
+
+
+def _perseus_title_stems(value: str) -> List[str]:
+    stop = {"the", "a", "an", "for", "on", "of", "to", "in", "de", "pro", "oratio", "liber", "book"}
+    normalized = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii").lower()
+    words = re.findall(r"[a-z0-9]+", normalized)
+    return [word[:5] for word in words if len(word) >= 4 and word not in stop]
+
+
+def _extract_perseus_blocks(
+    root: ET.Element,
+    language: str,
+    title: str = "",
+    version_label: str = "",
+) -> List[dict]:
+    bodies = [node for node in root.iter() if _xml_local_name(node.tag).lower() == "body"]
+    body = bodies[0] if bodies else None
+    if len(bodies) > 1 and (title or version_label):
+        parent_map = {child: parent for parent in root.iter() for child in list(parent)}
+        wanted = _perseus_title_stems(f"{title} {version_label}")
+
+        def body_score(candidate: ET.Element) -> int:
+            labels: List[str] = []
+            cursor: Optional[ET.Element] = candidate
+            for _ in range(4):
+                if cursor is None:
+                    break
+                labels.extend([str(cursor.attrib.get("n") or ""), str(cursor.attrib.get("type") or "")])
+                head = next((child for child in list(cursor) if _xml_local_name(child.tag).lower() == "head"), None)
+                if head is not None:
+                    labels.append(" ".join("".join(head.itertext()).split()))
+                cursor = parent_map.get(cursor)
+            candidate_stems = _perseus_title_stems(" ".join(labels))
+            return sum(
+                1
+                for left in wanted
+                for right in candidate_stems
+                if left == right or (len(left) >= 4 and len(right) >= 4 and (left.startswith(right) or right.startswith(left)))
+            )
+
+        scored = [(body_score(candidate), index, candidate) for index, candidate in enumerate(bodies)]
+        best_score, _, best_body = max(scored, key=lambda row: (row[0], -row[1]))
+        if best_score > 0:
+            body = best_body
+    if body is None:
+        raise ValueError("No TEI body found")
+    blocks: List[dict] = []
+    leaf_names = {"l", "p", "ab", "item", "entry", "stage"}
+
+    def walk(node: ET.Element, context: List[str]) -> None:
+        name = _xml_local_name(node.tag).lower()
+        next_context = context
+        if name.startswith("div"):
+            ref = str(node.attrib.get("n") or "").strip()
+            if ref:
+                next_context = context + [ref]
+        if name in leaf_names:
+            raw_text = " ".join("".join(node.itertext()).split())
+            if raw_text:
+                leaf_ref = str(node.attrib.get("n") or "").strip()
+                ref_parts = next_context + ([leaf_ref] if leaf_ref else [])
+                converted = beta_code_to_unicode(raw_text) if language in {"grc", "greek", "el"} else raw_text
+                converted = html.unescape(converted).strip()
+                if converted:
+                    blocks.append({"ref": ".".join(ref_parts), "text": converted})
+            return
+        for child in list(node):
+            walk(child, next_context)
+
+    walk(body, [])
+    if blocks:
+        return blocks
+
+    fallback = "\n".join(part.strip() for part in body.itertext() if part.strip())
+    if language in {"grc", "greek", "el"}:
+        fallback = beta_code_to_unicode(fallback)
+    return [{"ref": "1", "text": fallback}] if fallback else []
+
+
+def _blocks_to_sections(blocks: List[dict], target_words: int = 320) -> List[dict]:
+    sections: List[dict] = []
+    pending: List[dict] = []
+    pending_words = 0
+    active_top = ""
+
+    def flush() -> None:
+        nonlocal pending, pending_words
+        if not pending:
+            return
+        first_ref = pending[0]["ref"] or str(len(sections) + 1)
+        last_ref = pending[-1]["ref"] or first_ref
+        label = first_ref if first_ref == last_ref else f"{first_ref}–{last_ref}"
+        section_id = re.sub(r"[^A-Za-z0-9._-]+", "-", first_ref).strip("-") or str(len(sections) + 1)
+        if any(str(row.get("id")) == section_id for row in sections):
+            section_id = f"{section_id}-{len(sections) + 1}"
+        sections.append({
+            "id": section_id,
+            "label": label,
+            "original": "\n".join(row["text"] for row in pending),
+            "translation": "",
+        })
+        pending = []
+        pending_words = 0
+
+    for block in blocks:
+        top = str(block.get("ref") or "").split(".")[0]
+        word_count = len(str(block.get("text") or "").split())
+        if pending and ((top and active_top and top != active_top) or pending_words >= target_words or len(pending) >= 60):
+            flush()
+        if not pending:
+            active_top = top
+        pending.append(block)
+        pending_words += word_count
+    flush()
+    return sections
+
+
+def _load_perseus_text(descriptor: dict) -> dict:
+    urn = descriptor["urn"]
+    cached = PERSEUS_TEXT_CACHE.get(urn)
+    if cached:
+        return cached["value"]
+
+    document_id = descriptor.get("document_id")
+    if not document_id:
+        raise HTTPException(status_code=409, detail="Perseus does not offer a full-text download for this version")
+    try:
+        response = requests.get(
+            PERSEUS_DOWNLOAD_URL,
+            params={"doc": f"Perseus:text:{document_id}"},
+            timeout=60,
+        )
+        response.raise_for_status()
+        root = _clean_perseus_xml(response.content)
+        blocks = _extract_perseus_blocks(
+            root,
+            descriptor.get("language") or "",
+            descriptor.get("title") or "",
+            descriptor.get("version_label") or "",
+        )
+        sections = _blocks_to_sections(blocks)
+        if not sections:
+            raise ValueError("No readable passages found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"Perseus text load failed for {urn}: {exc}")
+        raise HTTPException(status_code=502, detail="This Perseus text could not be prepared right now") from exc
+
+    value = {
+        "id": descriptor["id"],
+        "title": descriptor["title"],
+        "author": descriptor["author"],
+        "language": descriptor["language"],
+        "meta": f"Perseus Digital Library · {descriptor['version_label']}",
+        "perseus_urn": urn,
+        "isPerseus": True,
+        "source_url": f"https://data.perseus.org/texts/{urn}",
+        "license": "Perseus Digital Library terms apply; see the source record for this edition.",
+        "sections": sections,
+    }
+    PERSEUS_TEXT_CACHE[urn] = {"saved_at": time.time(), "value": value}
+    while len(PERSEUS_TEXT_CACHE) > PERSEUS_TEXT_CACHE_MAX:
+        oldest = min(PERSEUS_TEXT_CACHE, key=lambda key: PERSEUS_TEXT_CACHE[key]["saved_at"])
+        PERSEUS_TEXT_CACHE.pop(oldest, None)
+    return value
+
+
+@app.get("/perseus/catalogue")
+def perseus_catalogue():
+    works, versions = get_perseus_catalog()
+    available = sum(1 for row in versions.values() if row.get("available"))
+    return {
+        "source": "Perseus Digital Library",
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "work_count": len(works),
+        "version_count": len(versions),
+        "available_version_count": available,
+        "works": works,
+    }
+
+
+@app.get("/perseus/work")
+def perseus_work(urn: str):
+    _, versions = get_perseus_catalog()
+    descriptor = versions.get(urn)
+    if not descriptor:
+        raise HTTPException(status_code=404, detail="Perseus edition not found")
+    return descriptor
+
+
+@app.get("/perseus/text")
+def perseus_text(urn: str):
+    _, versions = get_perseus_catalog()
+    descriptor = versions.get(urn)
+    if not descriptor:
+        raise HTTPException(status_code=404, detail="Perseus edition not found")
+    return _load_perseus_text(descriptor)
+
+
+# -------------------------
 # USER TEXT IMPORT ENDPOINTS
 # -------------------------
 
@@ -4425,14 +4769,6 @@ def require_valid_pro_token(request: Request) -> str:
     token = request.headers.get("X-Pro-Token")
     if not token or not customer_from_token(token):
         raise HTTPException(status_code=401, detail="Valid Pro token required")
-    return token
-
-
-def require_teacher_pro_token(request: Request) -> str:
-    token = require_valid_pro_token(request)
-    tier = get_token_tier(token)
-    if tier != "teacher":
-        raise HTTPException(status_code=403, detail="Teacher subscription required")
     return token
 
 
@@ -4508,98 +4844,6 @@ def assignment_questions_for_ids(cur, assignment_ids: List[int]) -> Dict[int, Li
             **row,
         })
     return grouped
-
-
-def assignment_stats(cur, assignment_id: int) -> dict:
-    cur.execute(
-        """
-        SELECT
-          a.id,
-          a.class_id,
-          a.type,
-          a.due_date,
-          COUNT(DISTINCT cm.id) AS total_students,
-          COUNT(DISTINCT s.id) AS submitted_count,
-          COUNT(DISTINCT s.id) FILTER (WHERE s.status = 'marked') AS marked_count,
-          COUNT(DISTINCT cm.id) FILTER (
-            WHERE
-              a.due_date IS NOT NULL
-              AND a.due_date < NOW()
-              AND (
-                s.id IS NULL
-                OR s.submitted_at > a.due_date
-              )
-          ) AS overdue_count,
-          AVG(score_bundle.total_awarded) FILTER (
-            WHERE s.status = 'marked' AND score_bundle.total_available > 0
-          ) AS average_score,
-          MAX(score_bundle.total_available) AS max_score
-        FROM assignments a
-        LEFT JOIN class_memberships cm ON cm.class_id = a.class_id
-        LEFT JOIN assignment_submissions s
-          ON s.assignment_id = a.id
-         AND (
-            (cm.pro_token IS NOT NULL AND s.student_pro_token = cm.pro_token)
-            OR
-            (cm.anon_id IS NOT NULL AND s.student_anon_id = cm.anon_id)
-         )
-        LEFT JOIN LATERAL (
-          SELECT
-            COALESCE(SUM(sa.marks_awarded), 0) AS total_awarded,
-            COALESCE(SUM(aq.marks), 0) AS total_available
-          FROM submission_answers sa
-          LEFT JOIN assignment_questions aq ON aq.id = sa.question_id
-          WHERE sa.submission_id = s.id
-        ) AS score_bundle ON TRUE
-        WHERE a.id = %s
-        GROUP BY a.id
-        """,
-        (assignment_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Assignment not found")
-    return {
-        "total_students": int(row.get("total_students") or 0),
-        "submitted_count": int(row.get("submitted_count") or 0),
-        "marked_count": int(row.get("marked_count") or 0),
-        "overdue_count": int(row.get("overdue_count") or 0),
-        "average_score": float(row["average_score"]) if row.get("average_score") is not None else None,
-        "max_score": int(row.get("max_score") or 0),
-    }
-
-
-def list_announcements_for_student(cur, identity: Dict[str, Optional[str]]) -> List[dict]:
-    cur.execute(
-        """
-        SELECT DISTINCT
-          ca.id,
-          ca.class_id,
-          c.name AS class_name,
-          ca.teacher_token,
-          ca.message,
-          ca.created_at
-        FROM class_announcements ca
-        JOIN classes c ON c.id = ca.class_id
-        JOIN class_memberships cm ON cm.class_id = c.id
-        WHERE (
-          (%s IS NOT NULL AND cm.pro_token = %s)
-          OR
-          (%s IS NOT NULL AND cm.anon_id = %s)
-        )
-        ORDER BY ca.created_at DESC, ca.id DESC
-        """,
-        (
-            identity["pro_token"],
-            identity["pro_token"],
-            identity["anon_id"],
-            identity["anon_id"],
-        ),
-    )
-    return [
-        {**row, "created_at": serialize_dt(row.get("created_at"))}
-        for row in (cur.fetchall() or [])
-    ]
 
 
 def count_words(text: str) -> int:
@@ -4951,12 +5195,13 @@ def delete_all_flashcards(request: Request):
 # TEACHER DASHBOARD
 # -------------------------
 
+# TODO: gate teacher features on a separate teacher Pro tier
 # TODO: email notifications to students when assignment is set
 # TODO: AI-assisted marking suggestions using /ai/exam-mark
 
 @app.post("/teacher/setup")
 def teacher_setup(req: TeacherSetupRequest, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     display_name = (req.display_name or "").strip() or None
     with get_db() as cur:
         cur.execute(
@@ -4978,7 +5223,7 @@ def teacher_setup(req: TeacherSetupRequest, request: Request):
 
 @app.get("/teacher/profile")
 def teacher_profile(request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -4996,7 +5241,7 @@ def teacher_profile(request: Request):
 
 @app.post("/teacher/classes")
 def create_teacher_class(req: TeacherClassCreateRequest, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     name = (req.name or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Class name required")
@@ -5016,7 +5261,7 @@ def create_teacher_class(req: TeacherClassCreateRequest, request: Request):
 
 @app.get("/teacher/classes")
 def list_teacher_classes(request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -5050,7 +5295,7 @@ def list_teacher_classes(request: Request):
 
 @app.delete("/teacher/classes/{class_id}")
 def delete_teacher_class(class_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute("DELETE FROM classes WHERE id = %s", (class_id,))
@@ -5058,8 +5303,8 @@ def delete_teacher_class(class_id: int, request: Request):
 
 
 @app.get("/teacher/classes/{class_id}/students")
-def list_class_students(class_id: int, request: Request, student_detail: Optional[str] = None):
-    teacher_token = require_teacher_pro_token(request)
+def list_class_students(class_id: int, request: Request):
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
@@ -5094,7 +5339,7 @@ def list_class_students(class_id: int, request: Request, student_detail: Optiona
             (class_id,),
         )
         rows = cur.fetchall() or []
-        response = {
+    return {
         "students": [
             {
                 **row,
@@ -5106,128 +5351,12 @@ def list_class_students(class_id: int, request: Request, student_detail: Optiona
             }
             for row in rows
         ]
-        }
-
-        detail_key = (student_detail or "").strip()
-        if detail_key:
-            cur.execute(
-                """
-                SELECT id, anon_id, pro_token, display_name, joined_at
-                FROM class_memberships
-                WHERE class_id = %s
-                  AND (
-                    anon_id = %s
-                    OR pro_token = %s
-                  )
-                LIMIT 1
-                """,
-                (class_id, detail_key, detail_key),
-            )
-            membership = cur.fetchone()
-            if membership:
-                cur.execute(
-                    """
-                    SELECT
-                      work_id,
-                      section_id,
-                      COUNT(*) AS session_count,
-                      COALESCE(SUM(words_tapped), 0) AS total_words_tapped,
-                      MAX(created_at) AS last_visited
-                    FROM study_events
-                    WHERE (
-                      (%s IS NOT NULL AND pro_token = %s)
-                      OR
-                      (%s IS NOT NULL AND anon_id = %s)
-                    )
-                    GROUP BY work_id, section_id
-                    ORDER BY MAX(created_at) DESC
-                    """,
-                    (
-                        membership.get("pro_token"),
-                        membership.get("pro_token"),
-                        membership.get("anon_id"),
-                        membership.get("anon_id"),
-                    ),
-                )
-                event_rows = cur.fetchall() or []
-
-                cur.execute(
-                    """
-                    SELECT DATE(created_at) AS event_day, COUNT(*) AS event_count
-                    FROM study_events
-                    WHERE (
-                      (%s IS NOT NULL AND pro_token = %s)
-                      OR
-                      (%s IS NOT NULL AND anon_id = %s)
-                    )
-                      AND created_at >= NOW() - INTERVAL '6 days'
-                    GROUP BY DATE(created_at)
-                    ORDER BY event_day ASC
-                    """,
-                    (
-                        membership.get("pro_token"),
-                        membership.get("pro_token"),
-                        membership.get("anon_id"),
-                        membership.get("anon_id"),
-                    ),
-                )
-                event_days = {
-                    row["event_day"].isoformat(): int(row.get("event_count") or 0)
-                    for row in (cur.fetchall() or [])
-                    if row.get("event_day")
-                }
-
-                grouped_works: Dict[str, dict] = {}
-                for row in event_rows:
-                    work_id = row.get("work_id") or ""
-                    work_bucket = grouped_works.setdefault(work_id, {
-                        "work_id": work_id,
-                        "sections": [],
-                        "session_count": 0,
-                        "total_words_tapped": 0,
-                        "last_visited": None,
-                    })
-                    section_payload = {
-                        "section_id": row.get("section_id"),
-                        "session_count": int(row.get("session_count") or 0),
-                        "total_words_tapped": int(row.get("total_words_tapped") or 0),
-                        "last_visited": serialize_dt(row.get("last_visited")),
-                    }
-                    work_bucket["sections"].append(section_payload)
-                    work_bucket["session_count"] += section_payload["session_count"]
-                    work_bucket["total_words_tapped"] += section_payload["total_words_tapped"]
-                    current_last = work_bucket.get("last_visited")
-                    next_last = section_payload["last_visited"]
-                    if next_last and (not current_last or next_last > current_last):
-                        work_bucket["last_visited"] = next_last
-
-                activity_days = []
-                today = datetime.utcnow().date()
-                for offset in range(6, -1, -1):
-                    day = (today - timedelta(days=offset)).isoformat()
-                    activity_days.append({
-                        "date": day,
-                        "active": bool(event_days.get(day)),
-                        "event_count": int(event_days.get(day) or 0),
-                    })
-
-                response["student_detail"] = {
-                    "identity": {
-                        "anon_id": membership.get("anon_id"),
-                        "pro_token": membership.get("pro_token"),
-                        "display_name": membership.get("display_name"),
-                        "joined_at": serialize_dt(membership.get("joined_at")),
-                    },
-                    "works": list(grouped_works.values()),
-                    "activity_days": activity_days,
-                }
-
-        return response
+    }
 
 
 @app.post("/teacher/assignments")
 def create_teacher_assignment(req: TeacherAssignmentCreateRequest, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     assignment_type = (req.type or "").strip()
     title = (req.title or "").strip()
     if assignment_type not in {"annotation", "question_set"}:
@@ -5293,7 +5422,7 @@ def create_teacher_assignment(req: TeacherAssignmentCreateRequest, request: Requ
 
 @app.get("/teacher/assignments/{class_id}")
 def list_teacher_assignments(class_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
@@ -5336,7 +5465,7 @@ def list_teacher_assignments(class_id: int, request: Request):
 
 @app.delete("/teacher/assignments/{assignment_id}")
 def delete_teacher_assignment(assignment_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         cur.execute(
             "SELECT id, teacher_token FROM assignments WHERE id = %s",
@@ -5353,7 +5482,7 @@ def delete_teacher_assignment(assignment_id: int, request: Request):
 
 @app.get("/teacher/submissions/{assignment_id}")
 def list_teacher_submissions(assignment_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -5377,7 +5506,6 @@ def list_teacher_submissions(assignment_id: int, request: Request):
               s.student_anon_id,
               s.student_pro_token,
               s.submitted_at,
-              s.marked_at,
               s.status,
               COALESCE(cm.display_name, s.student_anon_id, s.student_pro_token) AS student_name
             FROM assignment_submissions s
@@ -5449,7 +5577,6 @@ def list_teacher_submissions(assignment_id: int, request: Request):
             {
                 **row,
                 "submitted_at": serialize_dt(row.get("submitted_at")),
-                "marked_at": serialize_dt(row.get("marked_at")),
                 "student_identity": row.get("student_name") or row.get("student_anon_id") or row.get("student_pro_token"),
                 "answers": answers_by_submission.get(row["id"], []),
                 "submission_annotations": annotations_by_submission.get(row["id"], []),
@@ -5459,25 +5586,9 @@ def list_teacher_submissions(assignment_id: int, request: Request):
     }
 
 
-@app.get("/teacher/assignments/{assignment_id}/stats")
-def teacher_assignment_stats(assignment_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
-    with get_db() as cur:
-        cur.execute(
-            "SELECT id, teacher_token FROM assignments WHERE id = %s",
-            (assignment_id,),
-        )
-        assignment = cur.fetchone()
-        if not assignment:
-            raise HTTPException(status_code=404, detail="Assignment not found")
-        if assignment["teacher_token"] != teacher_token:
-            raise HTTPException(status_code=403, detail="Forbidden")
-        return assignment_stats(cur, assignment_id)
-
-
 @app.post("/teacher/mark")
 def mark_teacher_submission(req: TeacherMarkSubmissionRequest, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         cur.execute(
             """
@@ -5512,8 +5623,7 @@ def mark_teacher_submission(req: TeacherMarkSubmissionRequest, request: Request)
         cur.execute(
             """
             UPDATE assignment_submissions
-            SET status = 'marked',
-                marked_at = NOW()
+            SET status = 'marked'
             WHERE id = %s
             """,
             (req.submission_id,),
@@ -5523,7 +5633,7 @@ def mark_teacher_submission(req: TeacherMarkSubmissionRequest, request: Request)
 
 @app.post("/teacher/shared-resources")
 def create_shared_resource(req: SharedResourceCreateRequest, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     resource_type = (req.type or "").strip()
     if resource_type not in {"annotation", "example_question"}:
         raise HTTPException(status_code=400, detail="Invalid resource type")
@@ -5559,7 +5669,7 @@ def create_shared_resource(req: SharedResourceCreateRequest, request: Request):
 
 @app.get("/teacher/shared-resources/{class_id}")
 def list_teacher_shared_resources(class_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         require_class_owner(cur, class_id, teacher_token)
         cur.execute(
@@ -5577,7 +5687,7 @@ def list_teacher_shared_resources(class_id: int, request: Request):
 
 @app.delete("/teacher/shared-resources/{resource_id}")
 def delete_teacher_shared_resource(resource_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
+    teacher_token = require_valid_pro_token(request)
     with get_db() as cur:
         cur.execute(
             "SELECT id, teacher_token FROM shared_resources WHERE id = %s",
@@ -5590,66 +5700,6 @@ def delete_teacher_shared_resource(resource_id: int, request: Request):
             raise HTTPException(status_code=403, detail="Forbidden")
         cur.execute("DELETE FROM shared_resources WHERE id = %s", (resource_id,))
     return {"ok": True}
-
-
-@app.post("/teacher/announcements")
-def create_teacher_announcement(req: TeacherAnnouncementCreateRequest, request: Request):
-    teacher_token = require_teacher_pro_token(request)
-    message = (req.message or "").strip()
-    if not message:
-        raise HTTPException(status_code=400, detail="Message required")
-    with get_db() as cur:
-        require_class_owner(cur, req.class_id, teacher_token)
-        cur.execute(
-            """
-            INSERT INTO class_announcements (class_id, teacher_token, message)
-            VALUES (%s, %s, %s)
-            RETURNING id, class_id, teacher_token, message, created_at
-            """,
-            (req.class_id, teacher_token, message),
-        )
-        row = cur.fetchone()
-    return {**row, "created_at": serialize_dt(row.get("created_at"))}
-
-
-@app.delete("/teacher/announcements/{announcement_id}")
-def delete_teacher_announcement(announcement_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
-    with get_db() as cur:
-        cur.execute(
-            """
-            SELECT ca.id, ca.class_id, c.teacher_token
-            FROM class_announcements ca
-            JOIN classes c ON c.id = ca.class_id
-            WHERE ca.id = %s
-            """,
-            (announcement_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Announcement not found")
-        if row["teacher_token"] != teacher_token:
-            raise HTTPException(status_code=403, detail="Forbidden")
-        cur.execute("DELETE FROM class_announcements WHERE id = %s", (announcement_id,))
-    return {"ok": True}
-
-
-@app.get("/teacher/announcements/{class_id}")
-def list_teacher_announcements(class_id: int, request: Request):
-    teacher_token = require_teacher_pro_token(request)
-    with get_db() as cur:
-        require_class_owner(cur, class_id, teacher_token)
-        cur.execute(
-            """
-            SELECT id, class_id, teacher_token, message, created_at
-            FROM class_announcements
-            WHERE class_id = %s
-            ORDER BY created_at DESC, id DESC
-            """,
-            (class_id,),
-        )
-        rows = cur.fetchall() or []
-    return {"announcements": [{**row, "created_at": serialize_dt(row.get("created_at"))} for row in rows]}
 
 
 # -------------------------
@@ -5749,35 +5799,25 @@ def list_student_assignments(request: Request):
               a.instructions,
               a.due_date,
               a.created_at,
-              submission_bundle.submission_id,
-              submission_bundle.submitted_at,
-              submission_bundle.marked_at,
-              submission_bundle.status AS submission_status
+              EXISTS (
+                SELECT 1
+                FROM assignment_submissions s
+                WHERE s.assignment_id = a.id
+                  AND (
+                    (%s IS NOT NULL AND s.student_pro_token = %s)
+                    OR
+                    (%s IS NOT NULL AND s.student_anon_id = %s)
+                  )
+              ) AS submitted
             FROM assignments a
             JOIN classes c ON c.id = a.class_id
             JOIN class_memberships cm ON cm.class_id = c.id
-            LEFT JOIN LATERAL (
-              SELECT
-                s.id AS submission_id,
-                s.submitted_at,
-                s.marked_at,
-                s.status
-              FROM assignment_submissions s
-              WHERE s.assignment_id = a.id
-                AND (
-                  (%s IS NOT NULL AND s.student_pro_token = %s)
-                  OR
-                  (%s IS NOT NULL AND s.student_anon_id = %s)
-                )
-              ORDER BY s.submitted_at DESC, s.id DESC
-              LIMIT 1
-            ) AS submission_bundle ON TRUE
             WHERE (
                 (%s IS NOT NULL AND cm.pro_token = %s)
                 OR
                 (%s IS NOT NULL AND cm.anon_id = %s)
             )
-            ORDER BY a.due_date ASC NULLS LAST, a.created_at DESC, a.id DESC
+            ORDER BY a.created_at DESC, a.id DESC
             """,
             (
                 identity["pro_token"],
@@ -5798,13 +5838,7 @@ def list_student_assignments(request: Request):
                 **row,
                 "due_date": serialize_dt(row.get("due_date")),
                 "created_at": serialize_dt(row.get("created_at")),
-                "submitted": bool(row.get("submission_id")),
-                "submission": {
-                    "id": row.get("submission_id"),
-                    "status": row.get("submission_status"),
-                    "submitted_at": serialize_dt(row.get("submitted_at")),
-                    "marked_at": serialize_dt(row.get("marked_at")),
-                } if row.get("submission_id") else None,
+                "submitted": bool(row.get("submitted")),
                 "questions": questions_by_assignment.get(row["id"], []),
             }
             for row in rows
@@ -5869,7 +5903,7 @@ def submit_student_assignment(req: StudentSubmitAssignmentRequest, request: Requ
             """
             INSERT INTO assignment_submissions (assignment_id, student_anon_id, student_pro_token)
             VALUES (%s, %s, %s)
-            RETURNING id, assignment_id, student_anon_id, student_pro_token, submitted_at, marked_at, status
+            RETURNING id, assignment_id, student_anon_id, student_pro_token, submitted_at, status
             """,
             (req.assignment_id, identity["anon_id"], identity["pro_token"]),
         )
@@ -5905,14 +5939,7 @@ def submit_student_assignment(req: StudentSubmitAssignmentRequest, request: Requ
                         text,
                     ),
                 )
-    return {
-        "ok": True,
-        "submission": {
-            **submission,
-            "submitted_at": serialize_dt(submission.get("submitted_at")),
-            "marked_at": serialize_dt(submission.get("marked_at")),
-        },
-    }
+    return {"ok": True, "submission": {**submission, "submitted_at": serialize_dt(submission.get("submitted_at"))}}
 
 
 @app.get("/student/submissions")
@@ -5927,15 +5954,12 @@ def list_student_submissions(request: Request):
               s.student_anon_id,
               s.student_pro_token,
               s.submitted_at,
-              s.marked_at,
               s.status,
               a.title,
               a.type,
               a.work_id,
               a.section_id,
-              c.name AS class_name,
-              a.instructions,
-              a.due_date
+              c.name AS class_name
             FROM assignment_submissions s
             JOIN assignments a ON a.id = s.assignment_id
             JOIN classes c ON c.id = a.class_id
@@ -5956,7 +5980,6 @@ def list_student_submissions(request: Request):
         submissions = cur.fetchall() or []
         submission_ids = [row["id"] for row in submissions]
         answers_by_submission: Dict[int, List[dict]] = {}
-        annotations_by_submission: Dict[int, List[dict]] = {}
         if submission_ids:
             cur.execute(
                 """
@@ -5980,46 +6003,16 @@ def list_student_submissions(request: Request):
             )
             for row in cur.fetchall() or []:
                 answers_by_submission.setdefault(row["submission_id"], []).append(row)
-            cur.execute(
-                """
-                SELECT
-                  id,
-                  submission_id,
-                  token_index,
-                  token_text,
-                  annotation_text,
-                  created_at
-                FROM submission_annotations
-                WHERE submission_id = ANY(%s)
-                ORDER BY submission_id, token_index, id
-                """,
-                (submission_ids,),
-            )
-            for row in cur.fetchall() or []:
-                annotations_by_submission.setdefault(row["submission_id"], []).append({
-                    **row,
-                    "created_at": serialize_dt(row.get("created_at")),
-                })
     return {
         "submissions": [
             {
                 **row,
                 "submitted_at": serialize_dt(row.get("submitted_at")),
-                "marked_at": serialize_dt(row.get("marked_at")),
-                "due_date": serialize_dt(row.get("due_date")),
                 "answers": answers_by_submission.get(row["id"], []),
-                "submission_annotations": annotations_by_submission.get(row["id"], []),
             }
             for row in submissions
         ]
     }
-
-
-@app.get("/student/announcements")
-def list_student_announcements(request: Request):
-    identity = get_student_identity(request)
-    with get_db() as cur:
-        return {"announcements": list_announcements_for_student(cur, identity)}
 
 
 @app.get("/student/shared-resources")
