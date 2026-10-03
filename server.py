@@ -512,7 +512,7 @@ app.add_middleware(
 # -------------------------
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-0")
+CLAUDE_MODEL = (os.environ.get("CLAUDE_MODEL") or "claude-sonnet-4-6").strip()
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 FRONTEND_URL = os.environ["FRONTEND_URL"]
@@ -596,19 +596,21 @@ def customer_from_token(pro_token: str | None):
         return None
 
 
-def has_pro(pro_token: str | None) -> bool:
-    customer_id = customer_from_token(pro_token)
-    if not customer_id:
-        return False
-
-    try:
-        return stripe_customer_has_paid_access(customer_id)
-    except Exception as e:
-        print(f"Stripe check failed in has_pro for customer {customer_id}: {e}")
-        return False
+def has_feature_access(token: str | None) -> bool:
+    """All study features are free. Private data still requires a valid session."""
+    return True
 
 
-    return FRONTEND_URL
+@app.post("/access/session")
+def create_study_session(request: Request):
+    existing = request.headers.get("X-Pro-Token")
+    if existing and customer_from_token(existing):
+        return {"pro_token": existing, "access": "free"}
+    token = secrets.token_urlsafe(32)
+    user_id = "study_" + secrets.token_urlsafe(24)
+    with get_db() as cur:
+        cur.execute("INSERT INTO pro_tokens (token, customer_id) VALUES (%s, %s)", (token, user_id))
+    return {"pro_token": token, "access": "free"}
 
 
 def get_anon_id(request: Request) -> str | None:
@@ -2259,7 +2261,7 @@ def list_saved_ai_answers(request: Request):
 
 @app.post("/ai/saved-answers")
 def save_ai_answer(req: SaveAIAnswerRequest, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     answer_text = (req.answer_text or "").strip()
     associated_text = (req.associated_text or "").strip()
     prompt_type = (req.prompt_type or "").strip().lower()
@@ -2309,7 +2311,7 @@ def save_ai_answer(req: SaveAIAnswerRequest, request: Request):
 
 @app.delete("/ai/saved-answers/{answer_id}")
 def delete_saved_ai_answer(answer_id: str, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     target_id = (answer_id or "").strip()
     if not target_id:
         raise HTTPException(status_code=400, detail="answer_id required")
@@ -2325,7 +2327,7 @@ def delete_saved_ai_answer(answer_id: str, request: Request):
 @app.get("/ai/credits")
 def ai_credits(request: Request):
     pro = request.headers.get("X-Pro-Token")
-    if has_pro(pro):
+    if has_feature_access(pro):
         return {"pro": True, "remaining_credits": None, "limit": None}
 
     remaining = get_free_ai_remaining(request)
@@ -2346,7 +2348,7 @@ def memorize_judge(req: MemorizeJudgeRequest, request: Request):
 
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        uses_pro = has_pro(pro)
+        uses_pro = has_feature_access(pro)
         if not uses_pro:
             remaining = consume_free_ai_credit(request)
 
@@ -2480,7 +2482,7 @@ def generate_autoflashcards(req: AutoFlashcardsRequest, request: Request):
             raise HTTPException(status_code=400, detail="passage required")
 
         pro = request.headers.get("X-Pro-Token")
-        uses_pro = has_pro(pro)
+        uses_pro = has_feature_access(pro)
         remaining = None
         if not uses_pro:
             remaining = consume_free_ai_credits(request, 2)
@@ -2668,7 +2670,7 @@ def explain_word(req: ExplainWord, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
         memory = (req.prompt_memory or "").strip()
         memory_block = ""
@@ -2707,7 +2709,7 @@ def explain_link(req: ExplainLink, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
 
         a = req.from_word
@@ -2756,7 +2758,7 @@ def explain_passage(req: ExplainPassage, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
         memory = (req.prompt_memory or "").strip()
         memory_block = ""
@@ -2837,7 +2839,7 @@ def generate_exam_question(request: Request, req: Dict[str, Any] = Body(default_
 
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
 
         prompt = f"""
@@ -2916,7 +2918,7 @@ def mark_exam_question(req: ExamMarkRequest, request: Request):
 
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
 
         if marks == 5:
@@ -3055,7 +3057,7 @@ def fix_exam_answer(req: ExamFixRequest, request: Request):
 
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
 
         prompt = f"""
@@ -3114,7 +3116,7 @@ def annotate_work(req: AnnotateWorkRequest, request: Request):
     try:
         pro = request.headers.get("X-Pro-Token")
         remaining = None
-        if not has_pro(pro):
+        if not has_feature_access(pro):
             remaining = consume_free_ai_credit(request)
 
         memory = (req.prompt_memory or "").strip()
@@ -3484,13 +3486,13 @@ def get_podcast_preferences_row(customer_id: str) -> Dict[str, Any]:
 
 @app.get("/podcasts/preferences")
 def get_podcast_preferences(request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     return {"ok": True, "preferences": get_podcast_preferences_row(customer_id)}
 
 
 @app.post("/podcasts/preferences")
 def save_podcast_preferences(req: SavePodcastPreferencesRequest, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     minutes = normalize_podcast_minutes(req.target_minutes)
     tone = normalize_podcast_tone(req.tone)
     depth = normalize_podcast_depth(req.depth)
@@ -3515,7 +3517,7 @@ def save_podcast_preferences(req: SavePodcastPreferencesRequest, request: Reques
 
 @app.post("/podcasts/feedback")
 def save_podcast_feedback(req: SavePodcastFeedbackRequest, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     key = (req.feedback_key or "").strip().lower()
     allowed = {"too_basic", "too_dense", "too_long", "voice_mismatch", "great"}
     if key not in allowed:
@@ -3588,7 +3590,7 @@ def get_all_podcasts(request: Request):
 
 @app.get("/podcasts/{work_id}")
 def get_podcast_meta(work_id: str, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     with get_db() as cur:
         cur.execute("""
         SELECT work_id, created_at, updated_at, audio_mime, transcript_segments, chapters, voice, model
@@ -3622,8 +3624,8 @@ def get_podcast_audio(work_id: str, request: Request):
     token = request.headers.get("X-Pro-Token") or request.query_params.get("token")
     customer_id = customer_from_token(token)
     if not customer_id:
-        raise HTTPException(status_code=401, detail="Pro token required")
-    if not has_pro(token):
+        raise HTTPException(status_code=401, detail="Study session required")
+    if not has_feature_access(token):
         raise HTTPException(status_code=402, detail="Pro subscription required")
     with get_db() as cur:
         cur.execute("""
@@ -3698,7 +3700,7 @@ def get_podcast_audio(work_id: str, request: Request):
 
 @app.delete("/podcasts/{work_id}")
 def delete_podcast(work_id: str, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     target_id = (work_id or "").strip()
     if not target_id:
         raise HTTPException(status_code=400, detail="work_id required")
@@ -3721,7 +3723,7 @@ def delete_podcast(work_id: str, request: Request):
 def generate_podcast(req: PodcastGenerateRequest, request: Request):
     try:
         print("🎙️ Podcast generate: start")
-        customer_id = require_pro_user(request)
+        customer_id = require_study_user(request)
         print(f"🎙️ customer_id={customer_id} work_id={req.work_id}")
 
         if not req.sections:
@@ -3836,7 +3838,7 @@ def save_annotation(req: SaveAnnotation, request: Request):
 
     # Only Pro users can make annotations public
     visibility = req.visibility or "private"
-    if visibility == "public" and not has_pro(pro):
+    if visibility == "public" and not has_feature_access(pro):
         visibility = "private"
 
     with get_db() as cur:
@@ -4055,7 +4057,7 @@ def save_text_connection(req: SaveTextConnection, request: Request):
 
 @app.delete("/connections/{connection_id}")
 def delete_text_connection(connection_id: str, request: Request):
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
     target_id = (connection_id or "").strip()
     if not target_id:
         raise HTTPException(status_code=400, detail="connection_id required")
@@ -4749,26 +4751,19 @@ def get_user_id(request: Request) -> str | None:
     return None
 
 
-def require_pro_user(request: Request, allow_inactive: bool = False) -> str:
-    """Return customer id from pro token. Optionally skip active sub check."""
+def require_study_user(request: Request, allow_inactive: bool = False) -> str:
+    """Authenticate private study data, without checking payment status."""
     token = request.headers.get("X-Pro-Token")
     customer_id = customer_from_token(token)
     if not customer_id:
-        raise HTTPException(status_code=402, detail="Pro required")
-
-    if allow_inactive:
-        return customer_id
-
-    if not has_pro(token):
-        raise HTTPException(status_code=402, detail="No paid access found")
-
+        raise HTTPException(status_code=401, detail="A valid study session is required")
     return customer_id
 
 
 def require_valid_pro_token(request: Request) -> str:
     token = request.headers.get("X-Pro-Token")
     if not token or not customer_from_token(token):
-        raise HTTPException(status_code=401, detail="Valid Pro token required")
+        raise HTTPException(status_code=401, detail="Valid study session required")
     return token
 
 
@@ -5010,7 +5005,7 @@ class SaveTextRequest(BaseModel):
 @app.post("/texts/save")
 def save_text(req: SaveTextRequest, request: Request):
     """Save a pre-processed text to cloud (for migration/sync). Pro only."""
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
 
     with get_db() as cur:
         cur.execute("""
@@ -5134,7 +5129,7 @@ def list_flashcards(request: Request):
 @app.post("/flashcards/sync")
 def sync_flashcards(req: FlashcardSyncRequest, request: Request):
     """Replace all flashcard sets for the user (used for migration/sync)."""
-    customer_id = require_pro_user(request)
+    customer_id = require_study_user(request)
 
     with get_db() as cur:
         cur.execute("""
@@ -5175,7 +5170,7 @@ def sync_flashcards(req: FlashcardSyncRequest, request: Request):
 @app.delete("/flashcards")
 def delete_all_flashcards(request: Request):
     """Delete all flashcard sets for a user (used when moving off Pro)."""
-    customer_id = require_pro_user(request, allow_inactive=True)
+    customer_id = require_study_user(request, allow_inactive=True)
 
     with get_db() as cur:
         cur.execute("""
